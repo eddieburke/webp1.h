@@ -7417,9 +7417,10 @@ static W1_UNUSED int w1_le_smooth(const uint32_t *pix, int w, int h) {
 
 static W1_UNUSED int w1_le_uniform_stream(w1_le_ctx_t *ctx,
     const uint32_t *orig, uint32_t *res, uint32_t *scratch, int w, int h,
-    int level, int cache_bits, int mode, int green, const uint8_t *flat,
+    int level, int cache_bits, int sb, int mode, int green, const uint8_t *flat,
     uint8_t *modes, uint32_t *modepix, uint32_t *ximg, w1_bw_t *bw) {
-  int tx, ty, tw = (w + 31) >> 5, th = (h + 31) >> 5, color;
+  int tx, ty, tw = (w + (1 << sb) - 1) >> sb;
+  int th = (h + (1 << sb) - 1) >> sb, color;
   uint64_t cost;
   const uint32_t *src = orig;
   if (green) {
@@ -7429,13 +7430,36 @@ static W1_UNUSED int w1_le_uniform_stream(w1_le_ctx_t *ctx,
   }
   for (ty = 0; ty < th; ty++) for (tx = 0; tx < tw; tx++) {
     modes[ty * tw + tx] = (uint8_t)mode;
-    w1_le_retile(src, res, w, h, 5, tx, ty, mode);
+    w1_le_retile(src, res, w, h, sb, tx, ty, mode);
   }
   cost = w1_le_estimate(ctx, res, w, h, level, cache_bits, flat, ctx->counts);
   color = w1_le_color(ctx, res, w, h, level, cache_bits, flat, ximg, cost, &cost);
   w1_le_emit_image(ctx, res, w, h, level, cache_bits, green, 1,
-      color, 5, flat, modes, modepix, ximg, scratch, bw);
+      color, sb, flat, modes, modepix, ximg, scratch, bw);
   return green | (color << 1);
+}
+
+static W1_UNUSED int w1_le_alpha_rows(const uint32_t *orig, int w, int h) {
+  size_t across = 0, down = 0, rgb_h = 0, samples = 0;
+  int y, x;
+  if (w < 256 || h < 256) return 0;
+  for (y = 0; y + 1 < h; y += 4)
+    for (x = 0; x + 16 < w; x += 16) {
+      uint32_t p = orig[(size_t)y * w + x];
+      uint32_t nx = orig[(size_t)y * w + x + 1];
+      unsigned a = p >> 24;
+      across += a != (nx >> 24);
+      across += a != (orig[(size_t)y * w + x + 16] >> 24);
+      down += a != (orig[(size_t)(y + 1) * w + x] >> 24);
+      rgb_h += (size_t)w1_le_sabs((int)(p & 255) - (int)(nx & 255));
+      rgb_h += (size_t)w1_le_sabs((int)((p >> 8) & 255) -
+                                  (int)((nx >> 8) & 255));
+      rgb_h += (size_t)w1_le_sabs((int)((p >> 16) & 255) -
+                                  (int)((nx >> 16) & 255));
+      samples++;
+    }
+  return samples && across * 64 < samples && down * 16 > samples &&
+         rgb_h <= samples * 3;
 }
 
 static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
@@ -7457,6 +7481,11 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
    * L8/L9 regressing on tiny images (e.g. 16x16 went 414 -> 424). */
   while (cache_bits > 0 && (1 << cache_bits) > n) cache_bits--;
   const uint32_t *img = orig;
+  if (level >= 6 && w1_le_alpha_rows(orig, w, h)) {
+    w1_le_uniform_stream(ctx, orig, res, predres, w, h, level, cache_bits,
+                         9, 1, 0, flat, modes, modepix, ximg, bw);
+    return;
+  }
   if (level >= 6) {
     /* Hopeless fast path: near-maximal-entropy input leaves every L6 gate
      * on a raw winner (pred/color argued in w1_le_hopeless; green decided
@@ -7852,7 +7881,7 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
         w1_bw_t trial;
         w1_bw_init(&trial, NULL, 0);
         last_flags = w1_le_uniform_stream(ctx, orig, resB, predres, w, h, level,
-            cache_bits, candidates[i], green, flat, modes, modepix, ximg, &trial);
+            cache_bits, 5, candidates[i], green, flat, modes, modepix, ximg, &trial);
         last_mode = candidates[i]; last_green = green;
         if (!trial.err && w1_bw_bit_size(&trial) < best) {
           best = w1_bw_bit_size(&trial); best_mode = candidates[i]; best_green = green;
@@ -7866,7 +7895,7 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
               1, last_flags >> 1, 5, flat, modes, modepix, ximg, predres, bw);
         } else {
           w1_le_uniform_stream(ctx, orig, resB, predres, w, h, level,
-              cache_bits, best_mode, best_green, flat, modes, modepix, ximg, bw);
+              cache_bits, 5, best_mode, best_green, flat, modes, modepix, ximg, bw);
         }
       }
     }
