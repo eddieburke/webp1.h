@@ -11695,6 +11695,13 @@ static W1_UNUSED int w1_enc_lossy_payload(w1_mux_t *m, const uint8_t *rgba,
       }
     }
   }
+  if (large_frame && !has_alpha && q >= 20 && q <= 40 &&
+      chroma_act >= 0 && chroma_act <= 6 &&
+      chroma_range >= 64) {
+    sweep_span = 0;
+    refine = 0;
+    ninit = 1;
+  }
   vpay = w1_mux_chunk_begin(m, "VP8 ");
   if (!m->err) {
     /* Per-frame loop-filter search: the fitted level with the caller's
@@ -11840,7 +11847,8 @@ static W1_UNUSED int w1_enc_lossy_payload(w1_mux_t *m, const uint8_t *rgba,
         uv_def = -2 - (chroma_range >> 6);
         if (uv_def < -15) uv_def = -15;
       }
-      if (!has_alpha && large_frame && q <= 40 && chroma_act <= 6 &&
+      if (!has_alpha && large_frame && q >= 20 && q <= 40 &&
+          chroma_act <= 6 &&
           chroma_range >= 64) uv_def = -13;
       rduv.uv_delta = uv_def;
     }
