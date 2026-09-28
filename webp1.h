@@ -6072,6 +6072,31 @@ static W1_UNUSED uint64_t w1_bw_bit_size(const w1_bw_t *bw) {
   return (uint64_t)bw->bytes * 8 + (unsigned)bw->nbits;
 }
 
+static W1_UNUSED uint8_t *w1_bw_trial(const w1_bw_t *start,
+    const w1_bw_t *best, w1_bw_t *trial) {
+  *trial = *start;
+  trial->p = trial->end = NULL;
+  trial->err = 0;
+  if (start->p && !best->err && best->p < best->end) {
+    size_t need = best->bytes - start->bytes + (best->nbits != 0);
+    uint8_t *park = best->p + (best->nbits != 0);
+    if ((size_t)(best->end - park) >= need) {
+      trial->p = park; trial->end = best->end;
+      return park;
+    }
+  }
+  return NULL;
+}
+
+static W1_UNUSED void w1_bw_adopt(const w1_bw_t *start, w1_bw_t *best,
+    const w1_bw_t *trial, const uint8_t *park) {
+  size_t written = trial->bytes - start->bytes;
+  memmove(start->p, park, written);
+  *best = *trial;
+  best->p = start->p + written;
+  best->end = start->end;
+}
+
 /* Histogram of one clipped tile, channel-major (green,red,blue,alpha). */
 static W1_UNUSED void w1_le_tile_hist(const uint32_t *pix, int w,
                                       int x0, int y0, int x1, int y1, int *h) {
@@ -6507,18 +6532,13 @@ static W1_UNUSED void w1_le_stream(w1_le_ctx_t *ctx, const uint32_t *pix,
   w1_bw_put(bw, cache_bits != 0, 1);
   if (cache_bits) w1_bw_put(bw, (uint32_t)cache_bits, 4);
   w1_bw_put(bw, 0, 1);
-  if (level < 6) {
+  if (level < 6 && w1_le_uniform(pix, w * h)) {
     /* Below level 6 the single adapted stream is final, except for a
      * one-colour image: all four channel codes are single-symbol, so the
      * literal stream costs 0 bits per pixel and beats any token stream
      * (512x512: 126 -> 32 B) without running the LZ passes at all. */
-    if (w1_le_uniform(pix, w * h)) {
-      *bw = start;
-      w1_le_literal_stream(ctx, pix, w, h, flat, meta, -1, bw);
-    } else {
-      w1_le_finish(ctx, pix, w, h, level, depth, cache_bits, flat, present,
-                   bw, &ctx->tk[0]);
-    }
+    *bw = start;
+    w1_le_literal_stream(ctx, pix, w, h, flat, meta, -1, bw);
     ctx->tk[0].valid = 0;
     return;
   }
@@ -6526,34 +6546,45 @@ static W1_UNUSED void w1_le_stream(w1_le_ctx_t *ctx, const uint32_t *pix,
                &ctx->tk[0]);
   best = bw->err ? UINT64_MAX : w1_bw_bit_size(bw) - w1_bw_bit_size(&start);
   if (cache_bits) {
+    uint8_t *park = w1_bw_trial(&start, bw, &trial);
+    uint64_t cost;
     tk = &ctx->tk[0];
-    w1_bw_init(&trial, NULL, 0);
     w1_bw_put(&trial, 0, 2);
     w1_le_encode_tokens(ctx, pix, w, h, level, 0, flat, &trial, tk);
-    if (w1_bw_bit_size(&trial) < best) {
-      best = w1_bw_bit_size(&trial); choice = -1; pinned = tk;
+    cost = w1_bw_bit_size(&trial) - w1_bw_bit_size(&start);
+    if (!trial.err && cost < best) {
+      best = cost; choice = -1; pinned = tk;
+      if (park) { w1_bw_adopt(&start, bw, &trial, park); choice = -2; }
     }
   }
-  for (side = -1; side < 4; side++) {
+  for (side = -1; level >= 6 && side < 4; side++) {
     uint64_t cost;
     if (side >= 0 && best < (uint64_t)(unsigned)w * (unsigned)h) break;
-    w1_bw_init(&trial, NULL, 0);
+    trial = start; trial.p = trial.end = NULL; trial.err = 0;
     w1_le_literal_stream(ctx, pix, w, h, flat, meta, side, &trial);
-    cost = w1_bw_bit_size(&trial);
-    if (cost < best) { best = cost; choice = side + 1; }
+    cost = w1_bw_bit_size(&trial) - w1_bw_bit_size(&start);
+    if (!trial.err && cost < best) {
+      best = cost; choice = side + 1;
+    }
   }
-  if (w * h >= 1024 && best >= 1024) {
+  if (level >= 6 && w * h >= 1024 && best >= 1024) {
+    uint8_t *park;
+    uint64_t cost;
     tk = pinned == &ctx->tk[0] ? &ctx->tk[1] : &ctx->tk[0];
-    w1_bw_init(&trial, NULL, 0);
+    park = w1_bw_trial(&start, bw, &trial);
     w1_le_group_stream_legacy(ctx, pix, w, h, level, flat, meta, &trial, tk);
-    if (!trial.err && w1_bw_bit_size(&trial) < best) {
-      best = w1_bw_bit_size(&trial); choice = 5; pinned = tk;
+    cost = w1_bw_bit_size(&trial) - w1_bw_bit_size(&start);
+    if (!trial.err && cost < best) {
+      best = cost; choice = 5; pinned = tk;
+      if (park) { w1_bw_adopt(&start, bw, &trial, park); choice = -2; }
     }
     tk = pinned == &ctx->tk[0] ? &ctx->tk[1] : &ctx->tk[0];
-    w1_bw_init(&trial, NULL, 0);
+    park = w1_bw_trial(&start, bw, &trial);
     w1_le_group_stream(ctx, pix, w, h, level, flat, meta, &trial, tk);
-    if (!trial.err && w1_bw_bit_size(&trial) < best) {
-      best = w1_bw_bit_size(&trial); choice = 6; pinned = tk;
+    cost = w1_bw_bit_size(&trial) - w1_bw_bit_size(&start);
+    if (!trial.err && cost < best) {
+      best = cost; choice = 6; pinned = tk;
+      if (park) { w1_bw_adopt(&start, bw, &trial, park); choice = -2; }
     }
   }
   if (choice != -2) {
@@ -6642,6 +6673,40 @@ static W1_UNUSED void w1_le_retile(const uint32_t *orig, uint32_t *res,
         res[y * w + x] = db | (dg << 8) | (dr << 16) | (da << 24);
       }
     }
+  }
+}
+
+static W1_UNUSED uint32_t w1_le_pixel_delta(uint32_t a, uint32_t b) {
+  uint32_t lo = ((a & 0x00ff00ffu) | 0x01000100u) - (b & 0x00ff00ffu);
+  uint32_t hi = (((a >> 8) & 0x00ff00ffu) | 0x01000100u) - ((b >> 8) & 0x00ff00ffu);
+  return (lo & 0x00ff00ffu) | ((hi & 0x00ff00ffu) << 8);
+}
+
+static W1_UNUSED void w1_le_uniform_residual(const uint32_t *orig,
+    uint32_t *res, int w, int h, int sb, int mode) {
+  int x, y;
+  if (mode != 1 && mode != 2) {
+    int tw = (w + (1 << sb) - 1) >> sb, th = (h + (1 << sb) - 1) >> sb;
+    for (y = 0; y < th; y++) for (x = 0; x < tw; x++)
+      w1_le_retile(orig, res, w, h, sb, x, y, mode);
+    return;
+  }
+  for (y = 0; y < h; y++) {
+    const uint32_t *row = orig + (size_t)y * w;
+    uint32_t *dst = res + (size_t)y * w;
+    const uint32_t *prev = y ? row - w : NULL;
+    dst[0] = w1_le_pixel_delta(row[0], prev ? prev[0] : 0xff000000u);
+    x = 1;
+#ifdef W1_USE_SSE2
+    for (; x + 4 <= w; x += 4) {
+      __m128i a = _mm_loadu_si128((const __m128i *)(row + x));
+      __m128i b = _mm_loadu_si128((const __m128i *)
+          (mode == 1 || !prev ? row + x - 1 : prev + x));
+      _mm_storeu_si128((__m128i *)(dst + x), _mm_sub_epi8(a, b));
+    }
+#endif
+    for (; x < w; x++)
+      dst[x] = w1_le_pixel_delta(row[x], mode == 1 || !prev ? row[x - 1] : prev[x]);
   }
 }
 
@@ -7217,8 +7282,15 @@ static W1_UNUSED void w1_le_pal_pack(const uint32_t *px, int w, int h,
                                      const uint32_t *tab, int ts,
                                      int wb, int new_w, uint32_t *dst) {
   int bpp = 8 >> wb, lanes = 1 << wb, x, y;
+  uint16_t index[1024];
   uint32_t lv = 0;
   int li = -1;   /* last (colour, index): runs skip the search */
+  memset(index, 0, sizeof(index));
+  for (x = 0; x < ts; x++) {
+    unsigned slot = (tab[x] * 0x9E3779B1u) >> 22;
+    while (index[slot]) slot = (slot + 1) & 1023;
+    index[slot] = (uint16_t)(x + 1);
+  }
   for (y = 0; y < h; y++) {
     const uint32_t *row = px + (size_t)y * w;
     uint32_t *out = dst + (size_t)y * new_w;
@@ -7230,12 +7302,10 @@ static W1_UNUSED void w1_le_pal_pack(const uint32_t *px, int w, int h,
       for (xx = x; xx < xe; xx++) {
         uint32_t v = row[xx];
         if (li < 0 || v != lv) {
-          int lo = 0, hi = ts;
-          while (lo < hi) {
-            int mid = lo + (hi - lo) / 2;
-            if (tab[mid] < v) lo = mid + 1; else hi = mid;
-          }
-          lv = v; li = lo < ts && tab[lo] == v ? lo : 0;
+          unsigned slot = (v * 0x9E3779B1u) >> 22;
+          while (index[slot] && tab[index[slot] - 1] != v)
+            slot = (slot + 1) & 1023;
+          lv = v; li = index[slot] ? index[slot] - 1 : 0;
         }
         acc |= (uint32_t)li << (unsigned)(8 + (xx - x) * bpp);
       }
@@ -7283,6 +7353,13 @@ static W1_UNUSED void w1_le_pal_delta(const uint32_t *tab, int ts,
 static W1_UNUSED int w1_le_uniform(const uint32_t *pix, int n) {
   int i;
   for (i = 1; i < n; i++) if (pix[i] != pix[0]) return 0;
+  return 1;
+}
+
+static W1_UNUSED int w1_le_alpha_uniform(const uint32_t *pix, int n) {
+  int i;
+  for (i = 1; i < n; i++)
+    if ((pix[i] >> 24) != (pix[0] >> 24)) return 0;
   return 1;
 }
 
@@ -7419,7 +7496,7 @@ static W1_UNUSED int w1_le_uniform_stream(w1_le_ctx_t *ctx,
     const uint32_t *orig, uint32_t *res, uint32_t *scratch, int w, int h,
     int level, int cache_bits, int sb, int mode, int green, const uint8_t *flat,
     uint8_t *modes, uint32_t *modepix, uint32_t *ximg, w1_bw_t *bw) {
-  int tx, ty, tw = (w + (1 << sb) - 1) >> sb;
+  int tw = (w + (1 << sb) - 1) >> sb;
   int th = (h + (1 << sb) - 1) >> sb, color;
   uint64_t cost;
   const uint32_t *src = orig;
@@ -7428,12 +7505,10 @@ static W1_UNUSED int w1_le_uniform_stream(w1_le_ctx_t *ctx,
     green = w1_le_sub_green(scratch, w * h, ctx->htmp);
     src = scratch;
   }
-  for (ty = 0; ty < th; ty++) for (tx = 0; tx < tw; tx++) {
-    modes[ty * tw + tx] = (uint8_t)mode;
-    w1_le_retile(src, res, w, h, sb, tx, ty, mode);
-  }
+  memset(modes, mode, (size_t)tw * th);
+  w1_le_uniform_residual(src, res, w, h, sb, mode);
   cost = w1_le_estimate(ctx, res, w, h, level, cache_bits, flat, ctx->counts);
-  color = w1_le_color(ctx, res, w, h, level, cache_bits, flat, ximg, cost, &cost);
+  color = ximg ? w1_le_color(ctx, res, w, h, level, cache_bits, flat, ximg, cost, &cost) : 0;
   w1_le_emit_image(ctx, res, w, h, level, cache_bits, green, 1,
       color, sb, flat, modes, modepix, ximg, scratch, bw);
   return green | (color << 1);
@@ -7462,6 +7537,75 @@ static W1_UNUSED int w1_le_alpha_rows(const uint32_t *orig, int w, int h) {
          rgb_h <= samples * 3;
 }
 
+static W1_UNUSED unsigned w1_le_uniform_candidates(const uint32_t *pix,
+    int w, int h, int limit) {
+  static const int modes[6] = {1, 2, 3, 11, 12, 13};
+  int hist[4][256], i, sx, sy, c, order[6];
+  uint64_t costs[6], raw = 0;
+  unsigned mask = 0;
+  if (w < 2 || h < 2) return 0;
+  for (i = -1; i < 6; i++) {
+    uint64_t cost = 0;
+    memset(hist, 0, sizeof(hist));
+    for (sy = 0; sy < 16; sy++) for (sx = 0; sx < 16; sx++) {
+      int x = 1 + (int)((int64_t)(w - 2) * sx / 15);
+      int y = 1 + (int)((int64_t)(h - 2) * sy / 15);
+      size_t at = (size_t)y * w + x;
+      uint32_t v = pix[at], p = 0;
+      if (i >= 0)
+        p = w1_vp8l_predict(modes[i], pix[at - 1], pix[at - w],
+            pix[at - w - 1], x + 1 < w ? pix[at - w + 1] : pix[(size_t)y * w]);
+      for (c = 0; c < 4; c++)
+        hist[c][((v >> (c * 8)) - (p >> (c * 8))) & 255]++;
+    }
+    for (c = 0; c < 4; c++) cost += w1_le_hcost(hist[c]);
+    if (i < 0) raw = cost;
+    else {
+      int j = i;
+      while (j > 0 && costs[j - 1] > cost) {
+        costs[j] = costs[j - 1]; order[j] = order[j - 1]; j--;
+      }
+      costs[j] = cost; order[j] = modes[i];
+    }
+  }
+  for (i = 0; i < limit && i < 6; i++)
+    if (costs[i] < raw || costs[i] == 0) mask |= 1u << order[i];
+  return mask;
+}
+
+static W1_UNUSED void w1_le_palette_stream(w1_le_ctx_t *ctx,
+    const uint32_t *tab, int ts, const uint32_t *idx, uint32_t *res,
+    int w, int h, int level, int cache_bits, int mode, const uint8_t *flat,
+    uint32_t *modepix, w1_bw_t *bw) {
+  uint32_t delta[256];
+  const uint32_t *img = idx;
+  int tw = (w + 511) >> 9, th = (h + 511) >> 9, tx, ty;
+  uint8_t present[1024];
+  w1_le_pal_delta(tab, ts, delta);
+  w1_bw_put(bw, 1, 1);
+  w1_bw_put(bw, 3, 2);
+  w1_bw_put(bw, (uint32_t)(ts - 1), 8);
+  w1_bw_put(bw, 0, 1);
+  w1_le_encode_tokens(ctx, delta, ts, 1, 1, 0, flat, bw, NULL);
+  if (mode >= 0) {
+    w1_le_uniform_residual(idx, res, w, h, 9, mode);
+    for (ty = 0; ty < th; ty++) for (tx = 0; tx < tw; tx++) {
+      modepix[ty * tw + tx] = (uint32_t)mode << 8;
+    }
+    img = res;
+    w1_bw_put(bw, 1, 1);
+    w1_bw_put(bw, 0, 2);
+    w1_bw_put(bw, 7, 3);
+    w1_bw_put(bw, 0, 1);
+    w1_le_encode_tokens(ctx, modepix, tw, th, 1, 0, flat, bw, NULL);
+  }
+  w1_bw_put(bw, 0, 1);
+  w1_le_estimate(ctx, img, w, h, level, cache_bits, flat, ctx->counts);
+  w1_le_scan_present(img, w * h, present);
+  w1_le_stream(ctx, img, w, h, level, w1_le_depths[level], cache_bits,
+      flat, present, NULL, bw);
+}
+
 static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
                                  uint32_t *res, uint32_t *predres,
                                  uint32_t *resB, uint8_t *svmodes,
@@ -7471,20 +7615,45 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
                                  uint32_t *modepix, uint32_t *ximg,
                                  w1_bw_t *bw) {
   int n = w * h, use_pred = 0, use_green = 0, use_color = 0, k;
+  w1_bw_t start = *bw;
   int pred_sb = 3;
   int cache_bits = (int)w1_le_cachebits[level];
   /* Estimate of the chosen ARGB stream below level 6 (feeds the palette
    * trial); (uint64_t)-1 = no trial (level 6+ has its own, uniform skips). */
   uint64_t main_est = (uint64_t)-1;
+  int uniform = level >= 6 && w1_le_uniform(orig, n);
+  int hopeless = level >= 6 && !uniform && w1_le_hopeless(orig, w, h);
   /* A cache larger than the image only inflates the green alphabet
    * (256+24+cache) and Huffman tables; clamp to image size. Fixes
    * L8/L9 regressing on tiny images (e.g. 16x16 went 414 -> 424). */
   while (cache_bits > 0 && (1 << cache_bits) > n) cache_bits--;
   const uint32_t *img = orig;
+  if (hopeless && w1_le_alpha_uniform(orig, n)) {
+    w1_bw_put(bw, 0, 1);
+    w1_le_literal_stream(ctx, orig, w, h, flat, predres, -1, bw);
+    return;
+  }
+  if (level >= 6 && n >= 262144 && !uniform &&
+      w1_le_alpha_uniform(orig, n) && w1_le_smooth(orig, w, h)) {
+    int gray = 1;
+    for (k = 0; k < n; k++) {
+      unsigned p = orig[k];
+      if ((p & 255u) != ((p >> 8) & 255u) ||
+          ((p >> 8) & 255u) != ((p >> 16) & 255u)) {
+        gray = 0;
+        break;
+      }
+    }
+    if (!gray) {
+      w1_le_uniform_stream(ctx, orig, res, predres, w, h, level, cache_bits,
+                           5, 12, 0, flat, modes, modepix, ximg, bw);
+      goto candidates;
+    }
+  }
   if (level >= 6 && w1_le_alpha_rows(orig, w, h)) {
     w1_le_uniform_stream(ctx, orig, res, predres, w, h, level, cache_bits,
                          9, 1, 0, flat, modes, modepix, ximg, bw);
-    return;
+    goto candidates;
   }
   if (level >= 6) {
     /* Hopeless fast path: near-maximal-entropy input leaves every L6 gate
@@ -7499,7 +7668,7 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
      * sl = 1 as w1_le_branch's gates) pick the same A/B winner the full
      * search would, including its strict totB < totA tie-break. */
     int fast_raw = 0;
-    if (w1_le_uniform(orig, n) || w1_le_hopeless(orig, w, h)) {
+    if (uniform || hopeless) {
       for (k = 0; k < n; k++) res[k] = orig[k];
       use_green = w1_le_sub_green(res, n, ctx->htmp);
       if (!use_green) {
@@ -7541,7 +7710,7 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
 #endif
     if (W1_LE_PAL_FORCE_TS > 0 && n <= W1_LE_PAL_MAXN) {
       uint32_t ptab0[256];
-      int ts0 = w1_le_pal_table(orig, n, ptab0);
+      int ts0 = w1_le_pal_table_fast(orig, n, ptab0);
       pal_only = ts0 >= W1_LE_PAL_MINTS && ts0 <= W1_LE_PAL_FORCE_TS;
     }
     if (pal_only) {
@@ -7618,7 +7787,7 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
      * and fall through bit-identical. */
     if (n <= W1_LE_PAL_MAXN) {
       uint32_t ptab[256];
-      int ts = w1_le_pal_table(orig, n, ptab);
+      int ts = w1_le_pal_table_fast(orig, n, ptab);
       if (ts >= W1_LE_PAL_MINTS && ts <= 256) {
         int wb;
         int new_w;
@@ -7687,6 +7856,7 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
           w1_le_scan_present(resB, n_idx, presentP);
           w1_le_stream(ctx, resB, new_w, h, lvl, (int)w1_le_depths[lvl],
                        cb_idx, flat, presentP, predres, bw);
+          if (ts > 2) goto candidates;
           return;
         }
         if (!useC) ctx->pal_seen = 1;
@@ -7862,41 +8032,105 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
         w1_le_stream(ctx, idx, new_w, h, lvl, (int)w1_le_depths[lvl],
                      cb_idx, flat, presentP,
                      idx == res ? predres : res, bw);
-        return;
+        goto candidates;
       }
       for (k = 0; k < W1_LE_NC; k++) ctx->counts[k] = ctx->counts3[k];
     }
   }
   {
-    w1_bw_t start = *bw;
     w1_le_emit_image(ctx, img, w, h, level, cache_bits, use_green,
         use_pred, use_color, pred_sb, flat, modes, modepix, ximg, predres, bw);
-    if (level >= 9 && n >= 65536 && !w1_le_uniform(orig, n) && w1_le_smooth(orig, w, h)) {
+    if ((level < 3 && !w1_le_alpha_uniform(orig, n)) ||
+        (level >= 9 && n >= 65536 && !w1_le_uniform(orig, n) && w1_le_smooth(orig, w, h))) {
       static const int candidates[4] = {1, 2, 12, 13};
+      int trial_sb = level < 3 ? 9 : 5;
+      uint32_t *trial_res = level < 3 ? res : resB;
       uint64_t best = bw->err ? UINT64_MAX : w1_bw_bit_size(bw) - w1_bw_bit_size(&start);
       int i, green, best_mode = -1, best_green = 0;
       int last_mode = -1, last_green = 0, last_flags = 0;
       for (green = 0; green < (level >= 9 ? 2 : 1); green++)
         for (i = 0; i < (level >= 9 ? 4 : 2); i++) {
         w1_bw_t trial;
-        w1_bw_init(&trial, NULL, 0);
-        last_flags = w1_le_uniform_stream(ctx, orig, resB, predres, w, h, level,
-            cache_bits, 5, candidates[i], green, flat, modes, modepix, ximg, &trial);
+        uint8_t *park = w1_bw_trial(&start, bw, &trial);
+        uint64_t cost;
+        last_flags = w1_le_uniform_stream(ctx, orig, trial_res, predres, w, h, level,
+            cache_bits, trial_sb, candidates[i], green, flat, modes, modepix, ximg, &trial);
         last_mode = candidates[i]; last_green = green;
-        if (!trial.err && w1_bw_bit_size(&trial) < best) {
-          best = w1_bw_bit_size(&trial); best_mode = candidates[i]; best_green = green;
+        cost = w1_bw_bit_size(&trial) - w1_bw_bit_size(&start);
+        if (!trial.err && cost < best) {
+          best = cost; best_mode = candidates[i]; best_green = green;
+          if (park) { w1_bw_adopt(&start, bw, &trial, park); best_mode = -1; }
         }
       }
       if (best_mode >= 0) {
         *bw = start;
         if (best_mode == last_mode && best_green == last_green) {
-          w1_le_estimate(ctx, resB, w, h, level, cache_bits, flat, ctx->counts);
-          w1_le_emit_image(ctx, resB, w, h, level, cache_bits, last_flags & 1,
-              1, last_flags >> 1, 5, flat, modes, modepix, ximg, predres, bw);
+          w1_le_estimate(ctx, trial_res, w, h, level, cache_bits, flat, ctx->counts);
+          w1_le_emit_image(ctx, trial_res, w, h, level, cache_bits, last_flags & 1,
+              1, last_flags >> 1, trial_sb, flat, modes, modepix, ximg, predres, bw);
         } else {
-          w1_le_uniform_stream(ctx, orig, resB, predres, w, h, level,
-              cache_bits, 5, best_mode, best_green, flat, modes, modepix, ximg, bw);
+          w1_le_uniform_stream(ctx, orig, trial_res, predres, w, h, level,
+              cache_bits, trial_sb, best_mode, best_green, flat, modes, modepix, ximg, bw);
         }
+      }
+    }
+  }
+candidates:
+  if (ctx->sg_force >= 0 || ctx->sb_hint >= 0 ||
+      ctx->pal_force >= 0 || ctx->uni_force >= 0) return;
+  if (level < 9 && n >= 64 && !w1_le_uniform(orig, n)) {
+    unsigned mask = w1_le_uniform_candidates(orig, w, h, level < 3 ? 2 : 3);
+    int mode, best_mode = -1, alpha = !w1_le_alpha_uniform(orig, n);
+    uint64_t best = bw->err ? UINT64_MAX : w1_bw_bit_size(bw) - w1_bw_bit_size(&start);
+    if (alpha) mask |= (1u << 1) | (1u << 2);
+    if (level < 3 && alpha) mask &= ~((1u << 1) | (1u << 2));
+    for (mode = 0; mode < 14; mode++) if (mask & (1u << mode)) {
+      w1_bw_t trial;
+      uint8_t *park = w1_bw_trial(&start, bw, &trial);
+      uint64_t cost;
+      w1_le_uniform_stream(ctx, orig, res, predres, w, h, level,
+          cache_bits, 9, mode, 0, flat, modes, modepix, NULL, &trial);
+      cost = w1_bw_bit_size(&trial) - w1_bw_bit_size(&start);
+      if (!trial.err && cost < best) {
+        best = cost; best_mode = mode;
+        if (park) { w1_bw_adopt(&start, bw, &trial, park); best_mode = -1; }
+      }
+    }
+    if (best_mode >= 0) {
+      *bw = start;
+      w1_le_uniform_stream(ctx, orig, res, predres, w, h, level,
+          cache_bits, 9, best_mode, 0, flat, modes, modepix, NULL, bw);
+    }
+  }
+  if (level < 9 && n >= 64 && n <= W1_LE_PAL_MAXN && !w1_le_uniform(orig, n)) {
+    uint32_t tab[256];
+    int ts = w1_le_pal_table_fast(orig, n, tab);
+    if (ts >= W1_LE_PAL_MINTS && ts <= 256) {
+      static const int candidates[4] = {-1, 1, 2, 12};
+      int wb = w1_le_pal_wb(ts), nw = (w + (1 << wb) - 1) >> wb;
+      int cb = cache_bits, i, best_mode = -2;
+      int lvl = w1_le_idx_level(level);
+      uint64_t best = bw->err ? UINT64_MAX : w1_bw_bit_size(bw) - w1_bw_bit_size(&start);
+      if (lvl > 5) lvl = 5;
+      while (cb > 0 && (1 << cb) > nw * h) cb--;
+      w1_le_pal_sort(tab, ts);
+      w1_le_pal_pack(orig, w, h, tab, ts, wb, nw, res);
+      for (i = 0; i < 4; i++) {
+        w1_bw_t trial;
+        uint8_t *park = w1_bw_trial(&start, bw, &trial);
+        uint64_t cost;
+        w1_le_palette_stream(ctx, tab, ts, res, predres, nw, h, lvl,
+            cb, candidates[i], flat, modepix, &trial);
+        cost = w1_bw_bit_size(&trial) - w1_bw_bit_size(&start);
+        if (!trial.err && cost < best) {
+          best = cost; best_mode = candidates[i];
+          if (park) { w1_bw_adopt(&start, bw, &trial, park); best_mode = -2; }
+        }
+      }
+      if (best_mode != -2) {
+        *bw = start;
+        w1_le_palette_stream(ctx, tab, ts, res, predres, nw, h, lvl,
+            cb, best_mode, flat, modepix, bw);
       }
     }
   }
@@ -8126,6 +8360,12 @@ static W1_UNUSED int w1_vp8l_encode_full(const uint32_t *pix, int w, int h,
   if (rc != 0) { bump->used = mark; return rc; }
   *out_len = len6;
   best_len = len6; best_level = 6;
+  if (w1_le_uniform(pix, (int)npix) ||
+      (w1_le_hopeless(pix, w, h) &&
+       w1_le_alpha_uniform(pix, (int)npix))) {
+    bump->used = mark;
+    return 0;
+  }
   if (len6 <= cap) {
     memcpy(tmp, out, len6);           /* keep the level-6 payload */
     bump->used = smark;               /* reuse its scratch for level 8 */
@@ -9065,7 +9305,7 @@ static W1_UNUSED void w1_vp8e_rgb_to_yuv(const uint8_t *rgba, size_t stride,
                                          uint8_t *up, uint8_t *vp, int uvs,
                                          int mb_w, int mb_h, int32_t *uvls) {
   int fw = mb_w * 16, fh = mb_h * 16, x, y;
-  unsigned avgr = 0, avgg = 0, avgb = 0;
+  uint64_t avgr = 0, avgg = 0, avgb = 0;
   size_t navg = 0;
   int have_avg;
   /* Reference transparent-area cleanup: pixels with alpha below
@@ -9314,9 +9554,8 @@ static const uint16_t w1k_vp8e_cbits8_pair[67] = {
 };
 static W1_UNUSED int w1_vp8e_block_bits8(const int16_t *lev, int start) {
   int k, last = -1, bits = 24;             /* ~3 bits for the EOB decision */
-  /* Hash-exact: same max-nonzero index as the forward scan, but scans from
-   * the end so dense blocks exit in 1 iteration instead of 16. */
-  for (k = 15; k >= start; k--) if (lev[k] != 0) { last = k; break; }
+  for (k = 15; k >= start; k--)
+    if (lev[w1k_vp8_zigzag[k]] != 0) { last = k; break; }
   if (last < 0) return 6;
   for (k = start; k <= last; k++) {
     const int a = w1_abs((int)lev[w1k_vp8_zigzag[k]]);
@@ -9804,26 +10043,26 @@ static W1_UNUSED void w1_vp8e_trellis(const int16_t *c0, const int16_t *c1,
       mode[c][t][0] = 0; nextc[c][t][0] = 0; val[c][t][0] = 0;
       mode[c][t][1] = 0; nextc[c][t][1] = 0; val[c][t][1] = 0;
       if (c < 15) {
-        int64_t z = lam * (int64_t)(c1[ie] + c0[iz]) + 8 * x * x +
+        int64_t z = lam * (int64_t)c0[iz] + 8 * x * x +
                     nz[c + 1][0];
-        if (z < bany) { bany = z; mode[c][t][0] = 1; }
         bnz = z; mode[c][t][1] = 1;
       }
       for (j = 0; j < nc; j++) {
         int a = cand[j], nt = 2;
-        int64_t q = lam * (int64_t)(c1[ie] +
-                        w1_vp8e_val_cost8(c0, c1, type, band, t, a, &nt)) +
+        int64_t q = lam * (int64_t)
+                        w1_vp8e_val_cost8(c0, c1, type, band, t, a, &nt) +
                     cdist[j] + (c < 15 ? any[c + 1][nt] : 0);
-        if (q < bany) {
-          bany = q; mode[c][t][0] = 2;
-          val[c][t][0] = (int16_t)(x < 0 ? -a : a);
-          nextc[c][t][0] = (int8_t)nt;
-        }
         if (q < bnz) {
           bnz = q; mode[c][t][1] = 2;
           val[c][t][1] = (int16_t)(x < 0 ? -a : a);
           nextc[c][t][1] = (int8_t)nt;
         }
+      }
+      if (lam * (int64_t)c1[ie] + bnz < bany) {
+        bany = lam * (int64_t)c1[ie] + bnz;
+        mode[c][t][0] = mode[c][t][1];
+        val[c][t][0] = val[c][t][1];
+        nextc[c][t][0] = nextc[c][t][1];
       }
       any[c][t] = bany;
       nz[c][t] = bnz;
@@ -10514,14 +10753,6 @@ static W1_UNUSED void w1_vp8e_polish_mb(w1_vp8e_t *en, int mbx, int mby,
   }
 }
 
-/* ---- Keyframe control partition + two-pass coef adaptation ----
- * Pass 1 tokenizes with the default tables and counts node outcomes into
- * cnt ([1056][2] zero/one ints). Each node then gets its maximum-likelihood
- * prob if the bits saved beat the update cost (flag under w1k_vp8_coef_upd
- * plus 8 value bits, with margin). The RD bit model is prob-independent
- * (fixed 8x costs), so pass-1 decisions stay frozen; pass 2 only re-emits
- * tokens under the adapted tables. Bit costs in 1/1024-bit units via the
- * S-table (S(v) = round(v*log2(v)*1024), S(0) = 0). */
 
 /* -n*log2(p/256), in 1/1024-bit units. p in [1,255]. */
 static W1_UNUSED uint64_t w1_vp8e_logcost(unsigned n, unsigned p) {
@@ -10548,7 +10779,7 @@ static W1_UNUSED int64_t w1_vp8e_adapt_probs(const int *cnt,
     unsigned tot = z + o, np, op = oldp[i], up;
     int64_t save, dcost;
     if (!tot) continue;
-    np = (z * 256 + tot / 2) / tot;
+    np = (unsigned)(((uint64_t)z * 256 + tot / 2) / tot);
     if (np < 1) np = 1; else if (np > 255) np = 255;
     if (np == op) continue;
     save = (int64_t)(w1_vp8e_logcost(z, op) +
@@ -10854,6 +11085,35 @@ static W1_UNUSED uint64_t w1_vp8e_rgb_sse_row(const uint8_t *sp,
   return s;
 }
 
+static W1_UNUSED uint64_t w1_vp8e_frame_sse(w1_vp8e_t *en,
+                                            const uint8_t *rgba,
+                                            size_t stride, uint8_t *scratch) {
+  const int w = en->w, h = en->h;
+  const int ys = en->d.y_stride, uvs = en->d.uv_stride;
+  const uint8_t *y = en->d.plane_y;
+  const uint8_t *u = en->d.plane_u, *v = en->d.plane_v;
+  uint8_t *second = scratch + (size_t)w * 4;
+  uint64_t s = 0;
+  int k;
+  w1_fancy_pair(y, NULL, u, v, u, v, scratch, NULL, w);
+  s += w1_vp8e_rgb_sse_row(rgba, scratch, w);
+  for (k = 1; k <= (h - 1) / 2; k++) {
+    w1_fancy_pair(y + (2 * k - 1) * ys, y + 2 * k * ys,
+                  u + (k - 1) * uvs, v + (k - 1) * uvs,
+                  u + k * uvs, v + k * uvs, scratch, second, w);
+    s += w1_vp8e_rgb_sse_row(rgba + (size_t)(2 * k - 1) * stride, scratch, w);
+    s += w1_vp8e_rgb_sse_row(rgba + (size_t)(2 * k) * stride, second, w);
+  }
+  if (!(h & 1)) {
+    const int last = (h - 1) / 2;
+    w1_fancy_pair(y + (h - 1) * ys, NULL,
+                  u + last * uvs, v + last * uvs,
+                  u + last * uvs, v + last * uvs, scratch, NULL, w);
+    s += w1_vp8e_rgb_sse_row(rgba + (size_t)(h - 1) * stride, scratch, w);
+  }
+  return s;
+}
+
 typedef struct {
   const uint8_t *probs;
   int force_b, lambda_num, uv_delta;
@@ -10880,6 +11140,7 @@ static W1_UNUSED int w1_vp8_encode_frame_core(const uint8_t *rgba, size_t stride
   const size_t y_sz = (size_t)mb_w * 16 * ((size_t)mb_h * 16);
   const size_t uv_sz = (size_t)mb_w * 8 * ((size_t)mb_h * 8);
   const size_t n_mb = (size_t)mb_w * (size_t)mb_h;
+  const int filter_search = rd && rd->no_lf_bump < 0 && prepared && n_mb >= 16;
   /* Control headroom covers worst-case prob updates (~2.5 KB). */
   const size_t ctl_cap = 1094 + 32 * n_mb + 16 + 4096;
   const size_t need = w1_vp8e_work_worst(mb_w, mb_h) + ctl_cap;
@@ -10892,15 +11153,20 @@ static W1_UNUSED int w1_vp8_encode_frame_core(const uint8_t *rgba, size_t stride
   int16_t *bestm;   /* frozen pass-1 winner levels, 25x16 per MB */
   int32_t *uvls_sc;
   int *tok_counts;
+  int zero_counts[12] = {0};
   uint8_t *adapt_probs, *adapt_upd;
+  uint8_t model_probs[1056];
+  const int learn_probs = !rd || !rd->probs;
   int64_t adapt_net;
-  int seg_on = 0, defer_tokens = 0;
+  int seg_on = 0;
   const int uv_delta = rd ? rd->uv_delta : 0;
   int8_t seg_q[4] = {0, 0, 0, 0}, seg_lf[4] = {0, 0, 0, 0};
   uint8_t seg_probs[3] = {255, 255, 255};
-  uint32_t tag;  size_t ctl_sz, tok_sz, tok_cap, tok_src_off = 0;
+  uint32_t tag;  size_t ctl_sz, tok_sz, tok_cap;
   int row, col;
   uint8_t *rec_rgba = NULL;
+  uint8_t *filter_save = NULL;
+  uint64_t filter_sse = 0, filter_raw_sse = 0;
 
   if (!rgba || !dst || !out_len) return 2;
   *out_len = 0;
@@ -10910,7 +11176,7 @@ static W1_UNUSED int w1_vp8_encode_frame_core(const uint8_t *rgba, size_t stride
   if (level < 0) level = 0; else if (level > 63) level = 63;
   if (sharpness < 0) sharpness = 0; else if (sharpness > 7) sharpness = 7;
   if (!work || work_cap < need) return 1;
-  if (sse_out) {
+  if (sse_out || filter_search) {
     size_t off = (need + 15u) & ~(size_t)15;
     if (work_cap >= off + (size_t)w * (size_t)h * 4 + 16)
       rec_rgba = work + off;
@@ -10925,6 +11191,7 @@ static W1_UNUSED int w1_vp8_encode_frame_core(const uint8_t *rgba, size_t stride
   en.org_y = (uint8_t *)w1_bump_alloc(&bump, y_sz, 1);
   en.org_u = (uint8_t *)w1_bump_alloc(&bump, uv_sz, 1);
   en.org_v = (uint8_t *)w1_bump_alloc(&bump, uv_sz, 1);
+  if (filter_search) filter_save = (uint8_t *)(void *)en.org_y;
   seg = (uint8_t *)w1_bump_alloc(&bump, n_mb, 1);
   ymb = (uint8_t *)w1_bump_alloc(&bump, n_mb, 1);
   eo = (uint8_t *)w1_bump_alloc(&bump, n_mb, 1);
@@ -10957,7 +11224,8 @@ static W1_UNUSED int w1_vp8_encode_frame_core(const uint8_t *rgba, size_t stride
   memset(rec_u, 0, uv_sz);
   memset(rec_v, 0, uv_sz);
   memset(ctx, 0, 9 * (size_t)(mb_w + 1) + 5 * (size_t)(mb_w + 1));
-  en.rd_probs = rd ? rd->probs : NULL;
+  memcpy(model_probs, w1k_vp8_coef_dflt, sizeof(model_probs));
+  en.rd_probs = learn_probs ? model_probs : rd->probs;
   en.tc_probs = NULL;
   en.polish_on = rd ? rd->polish : 0;
   if (prepared) {
@@ -11026,7 +11294,6 @@ static W1_UNUSED int w1_vp8_encode_frame_core(const uint8_t *rgba, size_t stride
      * (checker q60e6: -16 dB at equal bytes), so the coarse extension only
      * removes |1| tokens and never shrinks a larger level. */
     en.rdoq_on = ((q <= 36) || (counts[1] != 0)) ? 1 : (pc_textured ? 2 : 0);
-    defer_tokens = counts[1] != 0;
     /* W1_SEG_SPLIT=1 restores the two-segment split (smooth MBs at
      * q+W1_SEG_DSMOOTH). Measured off by default: the split is a step
      * function of q (engages near q_index 58) that made the size/SSE
@@ -11083,15 +11350,17 @@ static W1_UNUSED int w1_vp8_encode_frame_core(const uint8_t *rgba, size_t stride
   memcpy(en.d.coef_probs, w1k_vp8_coef_dflt, 1056);
 
   w1_benc_init(&ctl, ctl_buf, ctl_cap);
-  w1_vp8e_write_header(&ctl, q, 0, 0, level, sharpness, NULL,
-                       seg_on, 0, seg_q, seg_lf, seg_probs, uv_delta, 0, 0);
-  if (ctl.err) return 3;
 
   tok_cap = dst_cap - 10 - ctl_cap;
   if (tok_cap < 2) return 3;
   w1_benc_init(&tok, dst + 10, tok_cap);
 
   for (row = 0; row < mb_h; row++) {
+    if (learn_probs && row > 0) {
+      (void)w1_vp8e_adapt_probs(tok_counts, w1k_vp8_coef_dflt,
+                               model_probs, adapt_upd);
+      en.tc_probs = NULL;
+    }
     memset(en.d.left_tok, 0, 9);
     en.d.left_ym = 0;
     for (col = 0; col < mb_w; col++) {
@@ -11160,7 +11429,7 @@ static W1_UNUSED int w1_vp8_encode_frame_core(const uint8_t *rgba, size_t stride
 #elif defined(W1_B_OFF)
         if (0) {
 #else
-        if (en.rd_probs || (seg[idx] && sseB > (uint64_t)64)) {
+        if ((rd && rd->force_b) || sseB > (uint64_t)64) {
 #endif
           uint64_t bcost;
           int16_t blev[16][16];
@@ -11185,17 +11454,12 @@ static W1_UNUSED int w1_vp8_encode_frame_core(const uint8_t *rgba, size_t stride
       if (en.polish_on)
         w1_vp8e_polish_mb(&en, col, row, ymode, uvmode, bbmodes, best);
 
-      /* segment id, then modes -> control partition (decoder reads seg
-       * first when seg_upd_map is set). */
-      if (seg_on)
-        w1_benc_tree(&ctl, w1k_vp8_seg_tree, en.d.seg_tree_probs,
-                     seg[idx]);
-      w1_benc_tree(&ctl, w1k_vp8_kf_ymode_tree, w1k_vp8_kf_ymode_prob, ymode);
-      /* B sub-modes (commits brow/rcol) come between ymode and uvmode,
-       * mirroring the decoder's read order. */
-      if (ymode == W1_VP8_B)
-        w1_vp8e_write_bmodes(&ctl, &en.d, col, bbmodes);
-      w1_benc_tree(&ctl, w1k_vp8_uv_mode_tree, w1k_vp8_kf_uv_prob, uvmode);
+      if (ymode == W1_VP8_B) {
+        for (i = 0; i < 4; i++) {
+          en.d.above_brow[4 * col + i] = bbmodes[12 + i];
+          en.d.left_rcol[i] = bbmodes[3 + 4 * i];
+        }
+      }
       en.d.above_ym[col] = (uint8_t)ymode;
       en.d.left_ym = (uint8_t)ymode;
 
@@ -11203,14 +11467,19 @@ static W1_UNUSED int w1_vp8_encode_frame_core(const uint8_t *rgba, size_t stride
         uint8_t *ab = en.d.above_tok + 9 * col;
         uint8_t *lf = en.d.left_tok;
         int is_b = (ymode == W1_VP8_B);
+        uint8_t zero_nodes[25];
+        int zero_n = 0;
         if (!is_b) {
-          cfin = w1_vp8e_write_block(defer_tokens ? NULL : &tok, 1, lf, ab, 8, 8, best[24],
+          zero_nodes[zero_n++] = (uint8_t)(3 + lf[8] + ab[8]);
+          cfin = w1_vp8e_write_block(NULL, 1, lf, ab, 8, 8, best[24],
                                      w1k_vp8_coef_dflt, tok_counts);
           if (cfin > 1) eob |= 1u << 24;
           if (cfin != 0) eob |= 1u << 31;
         }
         for (k = 0; k < 16; k++) {
-          cfin = w1_vp8e_write_block(defer_tokens ? NULL : &tok, is_b ? 3 : 0, lf, ab,
+          zero_nodes[zero_n++] = (uint8_t)((is_b ? 9 : 0) +
+              lf[w1k_vp8_ctx_left[k]] + ab[w1k_vp8_ctx_above[k]]);
+          cfin = w1_vp8e_write_block(NULL, is_b ? 3 : 0, lf, ab,
                                      w1k_vp8_ctx_left[k],
                                      w1k_vp8_ctx_above[k], best[k],
                                      w1k_vp8_coef_dflt, tok_counts);
@@ -11218,13 +11487,17 @@ static W1_UNUSED int w1_vp8_encode_frame_core(const uint8_t *rgba, size_t stride
           if (is_b ? (cfin != 0) : (cfin != 1)) eob |= 1u << 31;
         }
         for (k = 16; k < 24; k++) {
-          cfin = w1_vp8e_write_block(defer_tokens ? NULL : &tok, 2, lf, ab,
+          zero_nodes[zero_n++] = (uint8_t)(6 +
+              lf[w1k_vp8_ctx_left[k]] + ab[w1k_vp8_ctx_above[k]]);
+          cfin = w1_vp8e_write_block(NULL, 2, lf, ab,
                                      w1k_vp8_ctx_left[k],
                                      w1k_vp8_ctx_above[k], best[k],
                                      w1k_vp8_coef_dflt, tok_counts);
           if (cfin > 1) eob |= 1u << k;
           if (cfin != 0) eob |= 1u << 31;
         }
+        if (!eob)
+          for (k = 0; k < zero_n; k++) zero_counts[zero_nodes[k]]++;
       }
       /* uvmode/ymode/levels for the pass-2 re-emit live in uvm[]/ymb[]/
        * bestm[] (seg[] was preassigned by the classifier and never
@@ -11245,107 +11518,97 @@ static W1_UNUSED int w1_vp8_encode_frame_core(const uint8_t *rgba, size_t stride
     }
   }
 
+  if (filter_search) {
+    const int levels[9] = {level, 0, 20, 16, 40, 63, 16, 16, 16};
+    const int sharps[9] = {sharpness, 0, 0, 0, 0, 0, 1, 2, 3};
+    const int trials = rd->no_lf_bump == -1 ? 9 : 3;
+    int trial, best_level = level, best_sharp = sharpness;
+    filter_sse = ~(uint64_t)0;
+    memcpy(filter_save, rec_y, y_sz);
+    memcpy(filter_save + y_sz, rec_u, uv_sz);
+    memcpy(filter_save + y_sz + uv_sz, rec_v, uv_sz);
+    for (trial = 0; trial < trials; trial++) {
+      uint64_t s;
+      int prior;
+      for (prior = 0; prior < trial; prior++)
+        if (levels[prior] == levels[trial] && sharps[prior] == sharps[trial]) break;
+      if (prior < trial) continue;
+      memcpy(rec_y, filter_save, y_sz);
+      memcpy(rec_u, filter_save + y_sz, uv_sz);
+      memcpy(rec_v, filter_save + y_sz + uv_sz, uv_sz);
+      en.d.level = levels[trial];
+      en.d.sharpness = sharps[trial];
+      if (en.d.level)
+        for (row = 0; row < mb_h; row++)
+          for (col = 0; col < mb_w; col++) w1_vp8_filter_mb(&en.d, col, row);
+      s = w1_vp8e_frame_sse(&en, rgba, stride, rec_rgba);
+      if (!levels[trial]) filter_raw_sse = s;
+      if (s < filter_sse) {
+        filter_sse = s;
+        best_level = levels[trial];
+        best_sharp = sharps[trial];
+      }
+    }
+    level = best_level; sharpness = best_sharp;
+    en.d.level = level; en.d.sharpness = sharpness;
+  }
+
   adapt_net = w1_vp8e_adapt_probs(tok_counts, w1k_vp8_coef_dflt,
                                   adapt_probs, adapt_upd);
   {
     size_t n_zero = 0, j;
+    int skip_on = 0, skip_prob = 255;
+    int use_adapt;
+    const uint8_t *emit_probs, *cupd;
     for (j = 0; j < n_mb; j++) if (!en.d.mb_eob[j]) n_zero++;
-    if (defer_tokens || adapt_net > W1_ADAPT_THRESH_UBITS || n_zero > 0) {
-      const int use_adapt = adapt_net > W1_ADAPT_THRESH_UBITS;
-      const uint8_t *emit_probs = use_adapt ? adapt_probs : w1k_vp8_coef_dflt;
-      const uint8_t *cupd = use_adapt ? adapt_upd : NULL;
-      int skip_on = 0, skip_prob = 255;
-      size_t off_total;
-      /* A candidate whose token partition alone passes the sweep adoption
-       * budget can never be adopted; cap the token writer for that trial.
-       * Zero MBs disable the cap: skip-on can shrink the tokens below it. */
-      const size_t trial_cap = n_zero > 0 ? 0 : tok_cap_limit;
-      if (n_zero > 0) {
-        int p = (int)(((uint64_t)(n_mb - n_zero) * 256 + n_mb / 2) / n_mb);
-        if (p < 1) p = 1; else if (p > 255) p = 255;
-        skip_prob = p;
+    if (n_zero > 0) {
+      const int64_t off_net = adapt_net > W1_ADAPT_THRESH_UBITS ? adapt_net : 0;
+      uint64_t removed = 0, flags;
+      int i;
+      int p = (int)(((uint64_t)(n_mb - n_zero) * 256 + n_mb / 2) / n_mb);
+      if (p < 1) p = 1; else if (p > 255) p = 255;
+      skip_prob = p;
+      for (i = 0; i < 12; i++) {
+        const int type = i / 3;
+        const int band = w1k_vp8_bands[type == 0 ? 1 : 0];
+        const size_t idx = W1_TOK_IDX(type, band, i % 3, W1_N_EOB);
+        removed += w1_vp8e_logcost((unsigned)zero_counts[i], w1k_vp8_coef_dflt[idx]);
+        tok_counts[2 * idx] -= zero_counts[i];
       }
-      /* Trial A: skip signalling off. */
-      w1_vp8e_emit_frozen(&en, &ctl, &tok, seg_on, seg_q, seg_lf, seg_probs,
-                          q, level, sharpness, uv_delta, 0, 255, cupd,
-                          emit_probs, mb_w, mb_h, uvm, bmod, bestm, trial_cap);
-      if (ctl.err || tok.err) return 3;
-      ctl_sz = w1_benc_stop(&ctl);
-      tok_sz = w1_benc_stop(&tok);
-      off_total = ctl_sz + tok_sz;
-      /* Trial B: skip signalling on, only when some MB is all-zero.  The
-       * flags cost one bool per MB, so adopt only when the elided tokens
-       * pay for them.  Trial B is written to the token partition's unused
-       * tail (after A's stream, whose worst case is the whole partition),
-       * and A's control partition is parked in the byte range the final
-       * assembly reserves for the control partition, so when B loses,
-       * A's finished stream is still in place and the historical rebuild
-       * (a third full-frame emit of the same inputs) is skipped.  When B
-       * does not fit the tail the old sequence runs unchanged (a tail
-       * overflow only proves B >= the room left), and a B that wins from
-       * the tail is moved down by the final memmove as the old stream was. */
-      if (n_zero > 0) {
-        size_t c2, t2, room = tok_cap - tok_sz;
-        int b_done = 0;
-        if (room > 0) {
-          w1_benc_t tokb;
-          const size_t a_len = tok_sz;
-          memcpy(dst + 10 + tok_cap, ctl_buf, ctl_sz);
-          w1_benc_init(&tokb, dst + 10 + a_len, room);
-          w1_vp8e_emit_frozen(&en, &ctl, &tokb, seg_on, seg_q, seg_lf, seg_probs,
-                              q, level, sharpness, uv_delta, 1, skip_prob, cupd,
-                              emit_probs, mb_w, mb_h, uvm, bmod, bestm, 0);
-          c2 = w1_benc_stop(&ctl);
-          t2 = w1_benc_stop(&tokb);
-          if (!ctl.err && !tokb.err) {
-            if (c2 + t2 < off_total) {
-              skip_on = 1;
-              tok_src_off = a_len;
-              ctl_sz = c2;
-              tok_sz = t2;
-            } else {
-              memcpy(ctl_buf, dst + 10 + tok_cap, ctl_sz);  /* A's ctl back */
-            }
-            b_done = 1;
-          }
+      adapt_net = w1_vp8e_adapt_probs(tok_counts, w1k_vp8_coef_dflt,
+                                      adapt_probs, adapt_upd);
+      flags = (uint64_t)8 * 1024 +
+              w1_vp8e_logcost((unsigned)n_zero, 256 - skip_prob) +
+              w1_vp8e_logcost((unsigned)(n_mb - n_zero), skip_prob);
+      if (removed + (uint64_t)(adapt_net > W1_ADAPT_THRESH_UBITS ? adapt_net : 0) >
+          (uint64_t)off_net + flags + 2 * 1024) {
+        skip_on = 1;
+      } else {
+        for (i = 0; i < 12; i++) {
+          const int type = i / 3;
+          const int band = w1k_vp8_bands[type == 0 ? 1 : 0];
+          const size_t idx = W1_TOK_IDX(type, band, i % 3, W1_N_EOB);
+          tok_counts[2 * idx] += zero_counts[i];
         }
-        if (!b_done) {
-          /* B did not fit the tail: write it over A's stream with the full
-           * cap, exactly as before, and rebuild A when it loses. */
-          w1_benc_init(&tok, dst + 10, tok_cap);
-          w1_vp8e_emit_frozen(&en, &ctl, &tok, seg_on, seg_q, seg_lf, seg_probs,
-                              q, level, sharpness, uv_delta, 1, skip_prob, cupd,
-                              emit_probs, mb_w, mb_h, uvm, bmod, bestm, 0);
-          if (ctl.err || tok.err) return 3;
-          c2 = w1_benc_stop(&ctl);
-          t2 = w1_benc_stop(&tok);
-          if (c2 + t2 < off_total) {
-            skip_on = 1;
-            ctl_sz = c2;
-            tok_sz = t2;
-          } else {
-            w1_vp8e_emit_frozen(&en, &ctl, &tok, seg_on, seg_q, seg_lf, seg_probs,
-                                q, level, sharpness, uv_delta, 0, 255, cupd,
-                                emit_probs, mb_w, mb_h, uvm, bmod, bestm, trial_cap);
-            if (ctl.err || tok.err) return 3;
-            ctl_sz = w1_benc_stop(&ctl);
-            tok_sz = w1_benc_stop(&tok);
-          }
-        }
+        adapt_net = w1_vp8e_adapt_probs(tok_counts, w1k_vp8_coef_dflt,
+                                        adapt_probs, adapt_upd);
       }
-    } else {
-      ctl_sz = w1_benc_stop(&ctl);
-      tok_sz = w1_benc_stop(&tok);
     }
+    use_adapt = adapt_net > W1_ADAPT_THRESH_UBITS;
+    emit_probs = use_adapt ? adapt_probs : w1k_vp8_coef_dflt;
+    cupd = use_adapt ? adapt_upd : NULL;
+    w1_vp8e_emit_frozen(&en, &ctl, &tok, seg_on, seg_q, seg_lf, seg_probs,
+                        q, level, sharpness, uv_delta, skip_on, skip_prob, cupd,
+                        emit_probs, mb_w, mb_h, uvm, bmod, bestm, tok_cap_limit);
+    if (ctl.err || tok.err) return 3;
+    ctl_sz = w1_benc_stop(&ctl);
+    tok_sz = w1_benc_stop(&tok);
   }
   if (ctl.err || tok.err || ctl_sz + 2 > ctl_cap) return 3;
   if (ctl_sz > 0x7ffffu) return 3;              /* 19-bit partition field */
   if (10 + ctl_sz + tok_sz > dst_cap) return 3;
 
-  /* Shift the token partition up to make room for the control partition.
-   * The tokens may start offset into the partition when trial B won from
-   * the tail (tok_src_off); memmove handles the overlap. */
-  memmove(dst + 10 + ctl_sz, dst + 10 + tok_src_off, tok_sz);
+  memmove(dst + 10 + ctl_sz, dst + 10, tok_sz);
   memcpy(dst + 10, ctl_buf, ctl_sz);
 
   dst[3] = 0x9d; dst[4] = 0x01; dst[5] = 0x2a;
@@ -11356,23 +11619,19 @@ static W1_UNUSED int w1_vp8_encode_frame_core(const uint8_t *rgba, size_t stride
   dst[1] = (uint8_t)((tag >> 8) & 0xff);
   dst[2] = (uint8_t)((tag >> 16) & 0xff);
   *out_len = 10 + ctl_sz + tok_sz;
-  if (sse_out && rec_rgba) {
-    w1_vp8_frame_t fr;
+  if (filter_search) {
+    if (sse_out) *sse_out = filter_sse;
+    if (unfiltered_sse_out) *unfiltered_sse_out = filter_raw_sse;
+  } else if (sse_out && rec_rgba) {
     uint64_t s;
-    int yy, pass;
+    int pass;
     for (pass = unfiltered_sse_out ? 0 : 1; pass < 2; pass++) {
       s = 0;
       if (pass && en.d.level) {
         for (row = 0; row < mb_h; row++)
           for (col = 0; col < mb_w; col++) w1_vp8_filter_mb(&en.d, col, row);
       }
-      fr.y = rec_y; fr.u = rec_u; fr.v = rec_v;
-      fr.y_stride = en.d.y_stride; fr.uv_stride = en.d.uv_stride;
-      fr.w = w; fr.h = h;
-      w1_vp8_yuv_to_rgba(&fr, rec_rgba);
-      for (yy = 0; yy < h; yy++)
-        s += w1_vp8e_rgb_sse_row(rgba + (size_t)yy * stride,
-                                 rec_rgba + (size_t)yy * (size_t)w * 4, w);
+      s = w1_vp8e_frame_sse(&en, rgba, stride, rec_rgba);
       if (pass) *sse_out = s;
       else *unfiltered_sse_out = s;
     }
@@ -11588,6 +11847,129 @@ static W1_UNUSED void w1_lossy_effort(int effort, int *span, int *adapt,
   *refine = effort == 9 ? 2 : 0;
   *ninit = effort == 9 ? 3 : 1;
 }
+static W1_UNUSED int w1_frame_rgb_color_count(const uint8_t *rgba,
+                                               size_t stride, int w, int h) {
+  uint32_t colors[128];
+  int n = 0, y, x, i;
+  for (i = 0; i < 128; i++) colors[i] = ~(uint32_t)0;
+  for (y = 0; y < h; y++) {
+    const uint8_t *row = rgba + (size_t)y * stride;
+    for (x = 0; x < w; x++) {
+      const uint8_t *p = row + (size_t)x * 4;
+      const uint32_t rgb = ((uint32_t)p[0] << 16) |
+                           ((uint32_t)p[1] << 8) | p[2];
+      unsigned slot = (rgb * 2654435761u) >> 25;
+      while (colors[slot] != ~(uint32_t)0 && colors[slot] != rgb)
+        slot = (slot + 1) & 127u;
+      if (colors[slot] == rgb) continue;
+      colors[slot] = rgb;
+      if (++n > 64) return 65;
+    }
+  }
+  return n;
+}
+static W1_UNUSED int w1_frame_periodic_tile(const uint8_t *rgba,
+                                             size_t stride, int w, int h) {
+  static const int periods[] = { 2, 4, 8, 16, 32, 64 };
+  int pi;
+  if (w < 64 || h < 64) return 0;
+  for (pi = 0; pi < (int)(sizeof(periods) / sizeof(periods[0])); pi++) {
+    const int p = periods[pi];
+    int sx, sy, ok = 1, varied = 0, x, y;
+    if (w < 2 * p || h < 2 * p) continue;
+    for (sy = 0; sy < 5 && ok; sy++) {
+      const int yy = (int)((uint64_t)(unsigned)sy * (unsigned)(h - 1) / 4);
+      for (sx = 0; sx < 5; sx++) {
+        const int xx = (int)((uint64_t)(unsigned)sx * (unsigned)(w - 1) / 4);
+        const uint8_t *a = rgba + (size_t)yy * stride + (size_t)xx * 4;
+        const uint8_t *b = rgba + (size_t)(yy % p) * stride + (size_t)(xx % p) * 4;
+        if (memcmp(a, b, 4) != 0) { ok = 0; break; }
+      }
+    }
+    if (!ok) continue;
+    for (y = 0; y < p && !varied; y++) {
+      const uint8_t *row = rgba + (size_t)y * stride;
+      for (x = 0; x < p; x++)
+        if (memcmp(rgba, row + (size_t)x * 4, 4) != 0) { varied = 1; break; }
+    }
+    if (!varied) continue;
+    for (y = 0; y < h && ok; y++) {
+      const uint8_t *row = rgba + (size_t)y * stride;
+      const uint8_t *base = rgba + (size_t)(y % p) * stride;
+      for (x = 0; x < w; x++)
+        if (memcmp(row + (size_t)x * 4, base + (size_t)(x % p) * 4, 4) != 0) {
+          ok = 0;
+          break;
+        }
+    }
+    if (ok) return p;
+  }
+  return 0;
+}
+static W1_UNUSED int w1_frame_identical_rows(const uint8_t *rgba,
+                                              size_t stride, int w, int h) {
+  int sy, sx, x, y, varied = 0;
+  if (w < 64 || h < 2) return 0;
+  for (sy = 1; sy < 5; sy++) {
+    const int yy = (int)((uint64_t)(unsigned)sy * (unsigned)(h - 1) / 4);
+    for (sx = 0; sx < 5; sx++) {
+      const int xx = (int)((uint64_t)(unsigned)sx * (unsigned)(w - 1) / 4);
+      const uint8_t *a = rgba + (size_t)yy * stride + (size_t)xx * 4;
+      const uint8_t *b = rgba + (size_t)xx * 4;
+      if (memcmp(a, b, 4) != 0) return 0;
+    }
+  }
+  for (x = 1; x < w; x++)
+    if (memcmp(rgba, rgba + (size_t)x * 4, 4) != 0) { varied = 1; break; }
+  if (!varied) return 0;
+  for (y = 1; y < h; y++)
+    if (memcmp(rgba, rgba + (size_t)y * stride, (size_t)w * 4) != 0)
+      return 0;
+  return 1;
+}
+static W1_UNUSED int w1_frame_low_gradient(const uint8_t *rgba,
+                                            size_t stride, int w, int h) {
+  int sx, sy, x, y, c, varied = 0;
+  if (w < 128 || h < 128) return 0;
+  for (sy = 0; sy < 5; sy++) {
+    y = (int)((uint64_t)(unsigned)sy * (unsigned)(h - 1) / 4);
+    for (sx = 0; sx < 5; sx++) {
+      const uint8_t *p;
+      x = (int)((uint64_t)(unsigned)sx * (unsigned)(w - 1) / 4);
+      p = rgba + (size_t)y * stride + (size_t)x * 4;
+      for (c = 0; c < 4; c++)
+        if (p[c] != rgba[c]) { varied = 1; break; }
+    }
+  }
+  if (!varied) return 0;
+  for (y = 0; y < h; y++) {
+    const uint8_t *row = rgba + (size_t)y * stride;
+    for (x = 1; x < w; x++) {
+      const uint8_t *p = row + (size_t)x * 4;
+      const uint8_t *left = p - 4;
+      for (c = 0; c < 4; c++) {
+        const int d = (int)p[c] - (int)left[c];
+        if (d < -3 || d > 3) return 0;
+      }
+      if (y > 0) {
+        const uint8_t *up = p - stride;
+        for (c = 0; c < 4; c++) {
+          const int d = (int)p[c] - (int)up[c];
+          if (d < -3 || d > 3) return 0;
+        }
+      }
+    }
+    if (y > 0) {
+      const uint8_t *p = row;
+      const uint8_t *up = p - stride;
+      for (c = 0; c < 4; c++) {
+        const int d = (int)p[c] - (int)up[c];
+        if (d < -3 || d > 3) return 0;
+      }
+    }
+  }
+  return 1;
+}
 /* Lossy: ALPH chunk when the frame carries transparency, then the VP8 chunk.
  * Sets *has_alpha_out for the caller's VP8X flags. Returns WEBP1_OK or an
  * error; *need is set on NO_MEMORY. */
@@ -11612,8 +11994,13 @@ static W1_UNUSED int w1_enc_lossy_payload(w1_mux_t *m, const uint8_t *rgba,
   uint64_t *predcost = NULL;
   int chroma_act = -1;   /* mean |adjacent U/V step|, -1 = unknown */
   int chroma_range = 0;  /* max U/V span over the frame */
+  int neutral_chroma = 0;
+  int rgb_colors = -1;
+  int probe_ready = 0, probe_q = q, probe_uv = 0;
+  uint8_t probe_probs[1056];
   size_t alen = 0, elen = 0, vp8_sz, apay, vpay;
   int has_alpha = 0, x, y, rc = 0;
+  int is_flat;
   w1_bump_t bump_a;
 
   for (y = 0; y < h && !has_alpha; y++) {
@@ -11621,6 +12008,14 @@ static W1_UNUSED int w1_enc_lossy_payload(w1_mux_t *m, const uint8_t *rgba,
     for (x = 0; x < w; x++) if (row[x * 4 + 3] != 255) { has_alpha = 1; break; }
   }
   if (has_alpha_out) *has_alpha_out = has_alpha;
+  is_flat = w1_frame_is_flat(rgba, stride, w, h);
+  if (is_flat && !has_alpha) {
+    q = 0;
+    filt_level = w1_vp8_filter_level_for_q(q);
+    sweep_span = 0;
+    refine = 0;
+    ninit = 1;
+  }
 
   {
     const int mb_w = (w + 15) / 16, mb_h = (h + 15) / 16;
@@ -11717,6 +12112,8 @@ static W1_UNUSED int w1_enc_lossy_payload(w1_mux_t *m, const uint8_t *rgba,
           }
         }
         chroma_act = cnt ? (int)(acc / cnt) : 0;
+        neutral_chroma = umin == 128 && umax == 128 &&
+                         vmin == 128 && vmax == 128;
         /* Chroma range captures smooth ramps that the adjacent-step
          * activity misses (a ramp has a tiny step but a large span). */
         chroma_range = (umax - umin) > (vmax - vmin) ? umax - umin
@@ -11731,34 +12128,81 @@ static W1_UNUSED int w1_enc_lossy_payload(w1_mux_t *m, const uint8_t *rgba,
     refine = 0;
     ninit = 1;
   }
+  if (effort < 9 && !has_alpha && q < 80 && chroma_act > 6 &&
+      predcost && !is_flat) {
+    const size_t nm = (size_t)((w + 15) / 16) *
+                      (size_t)((h + 15) / 16);
+    size_t j;
+    for (j = 0; j < nm; j++)
+      if (predcost[j] > (uint64_t)256 * 32 * 32) break;
+    if (j < nm) {
+      q += 10;
+      if (q > 127) q = 127;
+      filt_level = w1_vp8_filter_level_for_q(q);
+    }
+  }
+  if (effort >= 9 && predcost)
+    rgb_colors = w1_frame_rgb_color_count(rgba, stride, w, h);
+  if (effort >= 9 && predcost && w >= 128 && h >= 128 &&
+      (uint64_t)(unsigned)w * (unsigned)h >= 16384 &&
+      (chroma_act > 6 || rgb_colors > 64) &&
+      !(!has_alpha && chroma_act <= 6 &&
+        (q <= 10 || (q >= 38 && q <= 45 &&
+                     w1_frame_low_gradient(rgba, stride, w, h))))) {
+    const int pw = w >= 256 && h >= 256 ? 128 : 64, ph = pw;
+    const int blocks = pw / 16;
+    const size_t nm = (size_t)((w + 15) / 16) * ((h + 15) / 16);
+    const size_t pn = (size_t)pw * ph;
+    const size_t pcap = pn * 12 + 65536;
+    const size_t pneed = w1_enc_lossy_work_need(pw, ph);
+    uint8_t *pixels = (uint8_t *)(void *)(predcost + nm);
+    if (pixels <= vp8_work &&
+        (size_t)(vp8_work - pixels) >= pn * 4 + pcap + 16 + pneed) {
+      uint8_t *pout = pixels + pn * 4;
+      uint8_t *pwork = (uint8_t *)(void *)(((uintptr_t)(pout + pcap) + 15u) &
+                                          ~(uintptr_t)15);
+      w1_mux_t pm;
+      int bx, by, py;
+      for (by = 0; by < blocks; by++) {
+        const int sy = ((h / 16 - 1) * by / (blocks - 1)) * 16;
+        for (bx = 0; bx < blocks; bx++) {
+          const int sx = ((w / 16 - 1) * bx / (blocks - 1)) * 16;
+          for (py = 0; py < 16; py++) {
+            int px;
+            memcpy(pixels + ((size_t)(by * 16 + py) * pw + bx * 16) * 4,
+                   rgba + (size_t)(sy + py) * stride + (size_t)sx * 4, 64);
+            if (has_alpha)
+              for (px = 0; px < 16; px++)
+                pixels[((size_t)(by * 16 + py) * pw + bx * 16 + px) * 4 + 3] = 255;
+          }
+        }
+      }
+      w1_mux_init(&pm, pout, pcap);
+      if (w1_enc_lossy_payload(&pm, pixels, (size_t)pw * 4, pw, ph, q,
+            filt_level, sharpness, alph_level, effort, NULL,
+            pwork, pneed, NULL) == WEBP1_OK && !pm.err && pm.pos >= 18) {
+        const uint8_t *frame = pout + 8;
+        const unsigned tag = (unsigned)frame[0] | ((unsigned)frame[1] << 8) |
+                             ((unsigned)frame[2] << 16);
+        w1_vp8d_t pd;
+        w1_bool_t pc;
+        memset(&pd, 0, sizeof(pd));
+        w1_bool_init(&pc, frame + 10, tag >> 5);
+        if (w1_vp8_parse_header(&pc, &pd) == 0 && pd.uvdc_d == pd.uvac_d) {
+          probe_q = pd.q_index;
+          probe_uv = pd.uvac_d;
+          memcpy(probe_probs, pd.coef_probs, sizeof(probe_probs));
+          probe_ready = 1;
+          sweep_span = 0;
+          refine = 0;
+          ninit = 1;
+        }
+      }
+    }
+  }
   vpay = w1_mux_chunk_begin(m, "VP8 ");
   if (!m->err) {
-    /* Per-frame loop-filter search: the fitted level with the caller's
-     * sharpness is the baseline; a bounded candidate set of levels, plus
-     * sharpness at the strong-filter point, is evaluated with a full
-     * sweep+RDO run each.  The winner is the shortest payload whose decoded
-     * (loop-filtered) SSE is no worse than the baseline's; a cell with no
-     * such candidate keeps the baseline.  Candidates are tried only when
-     * the content pre-pass is available and the frame is big enough for the
-     * level field to be worth a probe (>=16 MBs keeps the 32x32 header pin
-     * in test_lossy_filter_header on the fitted mapping).
-     *
-     * Round-2 pruning: on the fixed grid only levels 16-20 ever produced a
-     * strict win (edges 128 at q30/q75; every other probe level - 0, /2,
-     * x2, 40, 63 - won nowhere), so the candidate set dropped fitted/2,
-     * 40 and the level-20 sharpness probes: 15 sweep+RDO runs per frame
-     * became at most 9 at identical grid bytes.  The winner's payload is
-     * already in place when it was the last candidate evaluated, so the
-     * final re-emit is skipped in that case.
-     *
-     * Round-3 content gate: all fixed-grid wins were on grey structured
-     * frames (edges), and the search is pure overhead on smooth (gradient/
-     * flat) and chroma-noisy (photo/mixed) content - so it only runs when
-     * the frame class is "textured, low chroma" (the same split that drives
-     * the UV delta).  The content scans happen once per frame, not per
-     * attempt. */
     int textured = 0;
-    const int is_flat = w1_frame_is_flat(rgba, stride, w, h);
     /* Keeping the baseline payload lets the winner be restored by a copy
      * instead of a third full encode.  The upper half of the sweep's
      * scratch gap is free here: the block that uses that gap is gated on
@@ -11790,51 +12234,11 @@ static W1_UNUSED int w1_enc_lossy_payload(w1_mux_t *m, const uint8_t *rgba,
     {
       int n_mb = ((w + 15) / 16) * ((h + 15) / 16);
       att_level[n_att] = filt_level; att_sharp[n_att] = sharpness;
-      att_nobump[n_att] = 0; n_att++;
-      /* Smooth-frame deblock duel.  A frame whose every MB is under the
-       * complexity threshold gets its mapped level forced up to 20 inside
-       * the core, because the mapped (q-14)/2 under-filters the block edges
-       * quantisation leaves in a gentle ramp (gradient 128 q80: 40.06 ->
-       * 42.47 dB at identical bytes).  Near-lossless, that same bump is
-       * pure damage: gray_ramp is exactly reconstructed by TM_PRED, there
-       * are no edges to hide, and level 20 smears the result (64 q100:
-       * 50.87 dB filtered vs 53.02 dB with the mapped level, same bytes).
-       * The two cases are indistinguishable before the frame is coded -
-       * predcost is ~0 for both - so this settles it by measurement: one
-       * extra run with the bump suppressed, adopted only when it is a
-       * strict improvement on one axis and no worse on the other.  The
-       * level is a header field, so the usual outcome is identical bytes
-       * at better SSE. */
-      if (effort >= 9 && !large_frame && predcost && n_mb >= 16 && !textured && !is_flat) {
-        att_level[n_att] = filt_level; att_sharp[n_att] = sharpness;
-        att_nobump[n_att] = 1; n_att++;
-      }
-      /* Automatic max-effort tool: measured -86B on the whole LY grid for
-       * +4.2x total encode time (11x gated cells, several 0B wins), so it
-       * only runs at effort 9 (the "best" tier). */
-      if (effort >= 9 && !large_frame && predcost && n_mb >= 16 && textured &&
-          !is_flat && chroma_act <= 6) {
-        int want[5], nw = 0, i, j;
-        want[nw++] = 0;
-        want[nw++] = filt_level * 2;
-        want[nw++] = 16;
-        want[nw++] = 20;
-        want[nw++] = 63;
-        for (i = 0; i < nw; i++) {
-          int L = want[i], dup = 0;
-          if (L < 0) L = 0; else if (L > 63) L = 63;
-          for (j = 0; j < n_att; j++)
-            if (att_level[j] == L && att_sharp[j] == 0) { dup = 1; break; }
-          if (!dup && n_att < 9) {
-            att_level[n_att] = L; att_sharp[n_att] = 0;
-            att_nobump[n_att] = 0; n_att++;
-          }
-        }
-        for (i = 1; i <= 3 && n_att < 9; i++) {
-          att_level[n_att] = 16; att_sharp[n_att] = i;
-          att_nobump[n_att] = 0; n_att++;
-        }
-      }
+      att_nobump[n_att] = effort >= 9 && predcost && n_mb >= 16 &&
+                          !is_flat && (!textured || chroma_act <= 6)
+                            ? (w <= 128 && h <= 128 && textured ? -1 : -2) : 0;
+      win_nobump = att_nobump[n_att];
+      n_att++;
     }
     for (att = 0; att <= n_att && rc == 0; att++) {
     const int lev = att < n_att ? att_level[att] : win_level;
@@ -11856,7 +12260,7 @@ static W1_UNUSED int w1_enc_lossy_payload(w1_mux_t *m, const uint8_t *rgba,
     uint64_t att_sse = 0;
     static const int offs[3] = { 8, -8, 0 };
     uint64_t sses[3] = {0, 0, 0}, unfiltered_sses[3] = {0, 0, 0};
-    const int score_init = ninit > 1 || sweep_span >= 16 || refine;
+    const int score_init = ninit > 1 || sweep_span >= 16 || refine || probe_ready;
     /* (textured / is_flat are per-frame, computed once before the search;
      * textured drives the SSE slack, is_flat the min-SSE budget below.) */
     w1_vp8e_rd_t rduv;
@@ -11870,8 +12274,8 @@ static W1_UNUSED int w1_enc_lossy_payload(w1_mux_t *m, const uint8_t *rgba,
      * -4; smooth ramp (gradient) -> -2; constant -> 0. */
     {
       int uv_def;
-      if (textured) uv_def = (chroma_act > 6) ? 15 : 0;
-      else if (is_flat) uv_def = 0;
+      if (chroma_act > 6 && textured) uv_def = 15;
+      else if (is_flat || neutral_chroma) uv_def = 0;
       else {
         uv_def = -2 - (chroma_range >> 6);
         if (uv_def < -15) uv_def = -15;
@@ -11966,13 +12370,6 @@ static W1_UNUSED int w1_enc_lossy_payload(w1_mux_t *m, const uint8_t *rgba,
             (chroma_act > 6) ? W1_SWEEP_SSE_SLACK_CHROMA : W1_SWEEP_SSE_SLACK;
         const int sse_slack = q < W1_SWEEP_SLACK_Q
             ? (int)((long)sse_slack0 * q / W1_SWEEP_SLACK_Q) : sse_slack0;
-        /* Smooth non-flat frames (ramps): bytes are a staircase in q and the
-         * ratchet can lock the sweep onto the base plateau before a coarser
-         * step is reached (gradient q90: q18 is 36% shorter at +0.42 dB, but
-         * the early q8 adoption tightens dyn_cap first). They get the slack
-         * in sse_cap (seed for dyn_cap) and pick the shortest candidate
-         * within the guard-band floor instead of the ratchet. Flat frames
-         * keep the exact cap (budget rule governs them). */
         const int smooth_frame = !textured && !is_flat;
         const uint64_t sse_cap = (textured || smooth_frame)
             ? sses[2] + sses[2] * (uint64_t)sse_slack / 1000
@@ -11994,6 +12391,9 @@ static W1_UNUSED int w1_enc_lossy_payload(w1_mux_t *m, const uint8_t *rgba,
                          w >= 128 && h >= 128)
                         ? bestlen + (bestlen >> 4)   /* +6.25% */
                         : bestlen;
+        if (textured && chroma_act > 6 && q > 0 && q <= 80 && rgb_colors >= 0 &&
+            (rgb_colors <= 16 || rgb_colors > 64))
+          budget = bestlen + (bestlen >> 2);
         /* Constant-colour frames: bytes barely move with q, so allow a
          * longer (finer) point when it strictly lowers SSE (min-SSE first).
          * Gradient is excluded: min-SSE-first opened 69 gradient size gaps.
@@ -12038,14 +12438,15 @@ static W1_UNUSED int w1_enc_lossy_payload(w1_mux_t *m, const uint8_t *rgba,
 #define W1_SWEEP_FENCE_SLACK 250   /* SSE fence margin (per 1000 of cap) */
 #endif
         int lo_dead = -1, hi_dead = 128;
-        for (span = 16; span <= sweep_span && rc == 0; span *= 2) {
+        for (span = 16; span <= sweep_span && rc == 0 && (large_frame || bestsse); span *= 2) {
           if (sweep_adapt && span > sweep_adapt && !improved) break;
           improved = 0;
-          for (step = large_frame ? 8 : 4;
-               step >= (large_frame ? 8 : 1) && rc == 0; step /= 2) {
-            for (off = step; off <= span && rc == 0; off += step) {
+          for (step = large_frame || (textured && chroma_act > 6) ? 8 : 4;
+               step >= (large_frame || (textured && chroma_act > 6) ? 8 : 1) &&
+               rc == 0 && (large_frame || bestsse); step /= 2) {
+            for (off = step; off <= span && rc == 0 && (large_frame || bestsse); off += step) {
               int sign;
-              for (sign = 1; sign >= (large_frame ? 1 : -1); sign -= 2) {
+              for (sign = 1; sign >= (large_frame ? 1 : -1) && (large_frame || bestsse); sign -= 2) {
                 int qc = q + sign * off;
                 uint64_t csse;
                 size_t clen = 0;
@@ -12079,11 +12480,10 @@ static W1_UNUSED int w1_enc_lossy_payload(w1_mux_t *m, const uint8_t *rgba,
                 }
                 if (clen <= budget &&
                     (flat_frame ? (csse < bestsse)
-                     : smooth_frame ? (csse <= sse_cap && clen < bestlen)
                      : (csse <= dyn_cap &&
                         (clen < bestlen || csse < bestsse)))) {
                   bestq = qc; bestsse = csse; bestlen = clen; improved = 1;
-                  if (textured && csse < best_anchor) {
+                  if ((textured || smooth_frame) && csse < best_anchor) {
                     uint64_t nc;
                     best_anchor = csse;
                     nc = csse + csse * (uint64_t)sse_slack / 1000;
@@ -12097,7 +12497,8 @@ static W1_UNUSED int w1_enc_lossy_payload(w1_mux_t *m, const uint8_t *rgba,
             }
           }
         }
-        if (short_len && (short_len < bestlen ||
+        if (short_len && (best_anchor > sse_cap / 2 || short_sse <= dyn_cap) &&
+            (short_len < bestlen ||
                           (short_len == bestlen && short_sse < bestsse))) {
           bestq = short_q; bestlen = short_len; bestsse = short_sse;
         }
@@ -12168,20 +12569,23 @@ static W1_UNUSED int w1_enc_lossy_payload(w1_mux_t *m, const uint8_t *rgba,
                * only +-2,+-4 (text-128 q10e0: 1200 -> 1124 B at +1.9 dB).
                * Non-spare frames keep the historical step. */
               const int dstep = large_frame ? 12 :
-                  pass ? 4 : ((refine && !spare_db) ? 6 : 3);
+                  pass ? 4 : ((textured && chroma_act > 6 && q > 0) ? 12 :
+                              ((refine && !spare_db) ? 6 : 3));
               for (delta = pass ? fine_center - 2 : -W1_RDO_UV_COARSE;
                    delta <= (pass ? fine_center + 2 : W1_RDO_UV_COARSE); delta += dstep) {
                 int trial, qc = refine == 1 ? center : center - delta / 3, lo = -1, hi = 128;
                 if (delta < -15 || delta > 15) continue;
-                rd.uv_delta = delta;
+                rd.uv_delta = neutral_chroma ? 0 : delta;
                 for (trial = 0; trial < (large_frame ? 4 :
-                                         refine == 1 ? 1 : W1_RDO_TRIALS); trial++) {
+                                         refine == 1 ? 1 :
+                                         (textured && chroma_act > 6 && q > 0
+                                              ? 2 : W1_RDO_TRIALS)); trial++) {
                   uint64_t csse;
-                  int cr, next;
+                  int cr, next, emitted = 0;
                   if (qc < 0 || qc > 127) break;
                   int ci;
                   for (ci = 0; ci < cache_n; ci++)
-                    if (cache[ci].q == qc && cache[ci].delta == delta) break;
+                    if (cache[ci].q == qc && cache[ci].delta == rd.uv_delta) break;
                   if (ci < cache_n) {
                     clen = cache[ci].len; csse = cache[ci].sse;
                   } else {
@@ -12189,8 +12593,9 @@ static W1_UNUSED int w1_enc_lossy_payload(w1_mux_t *m, const uint8_t *rgba,
                       lev, shp, payload, m->cap - m->pos, &clen,
                       vp8_work, vp8_sz, &csse, NULL, prepared, predcost, &rd, 0);
                     if (cr) break;
+                    emitted = 1;
                     if (cache_n < 128) {
-                      cache[cache_n].q = qc; cache[cache_n].delta = delta;
+                      cache[cache_n].q = qc; cache[cache_n].delta = rd.uv_delta;
                       cache[cache_n].len = clen; cache[cache_n].sse = csse;
                       cache_n++;
                     }
@@ -12201,10 +12606,10 @@ static W1_UNUSED int w1_enc_lossy_payload(w1_mux_t *m, const uint8_t *rgba,
                      * target already spent the distortion surplus, and an
                      * equal-size/internal-SSE swap decoded 0.5 dB worse on
                      * edges-64 q10 (internal SSE misses that regression). */
-                    if (clen < bestlen ||
-                        (clen == bestlen && csse < bestsse && !spare_db)) {
+                    if (emitted && (clen < bestlen ||
+                        (clen == bestlen && csse < bestsse && !spare_db))) {
                       bestsse = csse; bestlen = clen; best_delta = delta;
-                      fin_refined = 1; fin_q = qc; fin_delta = delta;
+                      fin_refined = 1; fin_q = qc; fin_delta = rd.uv_delta;
                       memcpy(saved, payload, bestlen);
                     }
                   } else hi = qc;
@@ -12255,6 +12660,81 @@ static W1_UNUSED int w1_enc_lossy_payload(w1_mux_t *m, const uint8_t *rgba,
           } else {
             memcpy(payload, scratch, bestlen);
           }
+        }
+      }
+      if (rc == 0 && probe_ready && bestlen > 0) {
+        const size_t nm = (size_t)((w + 15) / 16) * ((h + 15) / 16);
+        uint8_t *saved = (uint8_t *)(void *)(predcost + nm);
+        if (saved <= vp8_work && (size_t)(vp8_work - saved) >= bestlen) {
+          uint8_t *payload = m->base + m->pos;
+          uint8_t tested[128] = {0};
+          const int slack = q < 32 ? q * 100 / 32 : 100;
+          const int quality_mode = !has_alpha && chroma_act <= 6;
+          const int trials = quality_mode ? (large_frame ? 4 : 8)
+                                          : (large_frame ? 2 : 4);
+          const size_t rate_cap = bestlen;
+          uint64_t anchor = bestsse;
+          uint64_t target = anchor + anchor * (unsigned)slack / 1000;
+          w1_vp8e_rd_t rd;
+          int trial, qc = probe_q, lo = -1, hi = 128, adopted = 0;
+          rd.probs = probe_probs;
+          rd.force_b = 0;
+          rd.lambda_num = 4;
+          rd.uv_delta = probe_uv;
+          rd.polish = !large_frame;
+          rd.no_lf_bump = nbump;
+          memcpy(saved, payload, bestlen);
+          for (trial = 0; trial < trials; trial++) {
+            size_t clen = 0;
+            uint64_t csse = 0;
+            int cr, next;
+            if (quality_mode) {
+              static const int offsets[8] = {0, -8, -16, -24, -32, -4, -8, 8};
+              qc = (trial == 0 || trial >= 6 ? probe_q : q) + offsets[trial];
+            } else if (trial == trials - 1 && !adopted && !tested[q]) qc = q;
+            if (qc < 0) qc = 0;
+            if (qc > 127) qc = 127;
+            if (tested[qc]) {
+              if (quality_mode) continue;
+              break;
+            }
+            tested[qc] = 1;
+            cr = w1_vp8_encode_frame_core(rgba, stride, w, h, qc,
+                 lev, shp, payload, m->cap - m->pos, &clen,
+                 vp8_work, vp8_sz, &csse, NULL, prepared, predcost, &rd, 0);
+            if (cr) break;
+            if (quality_mode) {
+              if (clen <= rate_cap &&
+                  (csse < bestsse || (csse == bestsse && clen < bestlen))) {
+                bestlen = clen;
+                bestsse = csse;
+                bestq = qc;
+                adopted = 1;
+                memcpy(saved, payload, bestlen);
+              }
+              continue;
+            }
+            if (csse <= target) {
+              lo = qc;
+              if (clen < bestlen || (clen == bestlen && csse < bestsse)) {
+                bestlen = clen;
+                bestsse = csse;
+                bestq = qc;
+                adopted = 1;
+                memcpy(saved, payload, bestlen);
+                if (csse < anchor) {
+                  anchor = csse;
+                  target = anchor + anchor * (unsigned)slack / 1000;
+                }
+              }
+            } else hi = qc;
+            if (lo >= 0 && hi < 128) next = (lo + hi) / 2;
+            else if (csse <= target) next = qc + 8;
+            else next = qc > q ? (qc + q) / 2 : qc - 8;
+            if (next == qc) break;
+            qc = next;
+          }
+          memcpy(payload, saved, bestlen);
         }
       }
       att_len = bestlen;
@@ -12554,6 +13034,77 @@ static W1_UNUSED int webp1_encode_lossy(const uint8_t *rgba, int w, int h,
   w1_mux_init(&m, out, out_cap);
   w1_mux_riff_begin(&m);
   use_vp8x = has_alpha || o->iccp_len > 0 || o->exif_len > 0 || o->xmp_len > 0;
+  if (use_vp8x) {
+    uint8_t flags = 0;
+    if (o->iccp_len) flags |= (uint8_t)W1_FLAG_ICC;
+    if (has_alpha) flags |= (uint8_t)W1_FLAG_ALPHA;
+    if (o->exif_len) flags |= (uint8_t)W1_FLAG_EXIF;
+    if (o->xmp_len) flags |= (uint8_t)W1_FLAG_XMP;
+    w1_mux_vp8x(&m, w, h, flags);
+    if (o->iccp_len) w1_mux_chunk_bytes(&m, "ICCP", o->iccp, o->iccp_len);
+  }
+  {
+    const int period = w1_frame_periodic_tile(rgba, stride, w, h);
+    const int repeated_rows = !period &&
+        w1_frame_identical_rows(rgba, stride, w, h);
+    const int low_gradient = !period && !repeated_rows &&
+        w1_frame_low_gradient(rgba, stride, w, h);
+    if ((period || repeated_rows || low_gradient) &&
+        wb >= webp1_encode_work_bound(w, h, 1)) {
+      const w1_mux_t start = m;
+      const int trials = low_gradient ? 2 : 1;
+      const uint64_t area = (uint64_t)(unsigned)w * (unsigned)h;
+      const int large_smooth = low_gradient && area >= 1048576;
+      int first_level = alph_level, second_level = alph_level;
+      int trial;
+      size_t max_bytes = period ? (size_t)period * (size_t)period :
+          repeated_rows ? (size_t)w :
+          (size_t)((uint64_t)(unsigned)w * (unsigned)h *
+                   (uint64_t)(3 + ((127 - q) * 4) / 100) / 1000);
+      if (max_bytes < 256) max_bytes = 256;
+      if (low_gradient) {
+        if (large_smooth) {
+          int gray = !has_alpha, sy, sx;
+          for (sy = 0; sy < 5 && gray; sy++) {
+            const int yy = (int)((uint64_t)(unsigned)sy * (unsigned)(h - 1) / 4);
+            for (sx = 0; sx < 5; sx++) {
+              const int xx = (int)((uint64_t)(unsigned)sx * (unsigned)(w - 1) / 4);
+              const uint8_t *p = rgba + (size_t)yy * stride + (size_t)xx * 4;
+              if (p[0] != p[1] || p[1] != p[2]) { gray = 0; break; }
+            }
+          }
+          first_level = gray ? 3 : (alph_level >= 6 ? 6 : 0);
+          second_level = first_level == 3 ? (alph_level >= 6 ? 6 : 0) : 3;
+        } else if (!has_alpha && area <= 65536) {
+          first_level = 0; second_level = 3;
+        } else {
+          first_level = 3; second_level = 0;
+        }
+      }
+      for (trial = 0; trial < trials; trial++) {
+        const int level = trial == 0 ? first_level : second_level;
+        if (low_gradient && trial == 1 && !large_smooth && first_level == 3 &&
+            max_bytes < (size_t)(area * 6 / 1000))
+          break;
+        m = start;
+        rc = w1_enc_lossless_payload(&m, rgba, stride, w, h, level,
+                                     NULL, work, work_cap, NULL);
+        if (rc == WEBP1_OK) {
+          if (use_vp8x) {
+            if (o->exif_len) w1_mux_chunk_bytes(&m, "EXIF", o->exif, o->exif_len);
+            if (o->xmp_len) w1_mux_chunk_bytes(&m, "XMP ", o->xmp, o->xmp_len);
+          }
+          w1_mux_riff_end(&m);
+          if (!m.err && m.pos <= max_bytes) {
+            *out_len = m.pos;
+            return WEBP1_OK;
+          }
+        }
+      }
+    }
+  }
+  w1_mux_init(&m, out, out_cap);
+  w1_mux_riff_begin(&m);
   if (use_vp8x) {
     uint8_t flags = 0;
     if (o->iccp_len) flags |= (uint8_t)W1_FLAG_ICC;
