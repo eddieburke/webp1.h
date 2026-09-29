@@ -1870,6 +1870,23 @@ static W1_UNUSED void w1_vp8_wht(const int16_t *in, int16_t *out) {
 #endif
 
 #ifdef W1_USE_SSE2
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
+/* Index of the lowest set bit of v (v != 0). */
+static W1_UNUSED int w1_ctz32(uint32_t v) {
+#if defined(_MSC_VER)
+  unsigned long i;
+  _BitScanForward(&i, v);
+  return (int)i;
+#elif defined(__GNUC__)
+  return __builtin_ctz(v);
+#else
+  int i = 0;
+  while (!(v & 1u)) { v >>= 1; i++; }
+  return i;
+#endif
+}
 static W1_UNUSED __m128i w1_mullo32_sse2(__m128i a, __m128i b) {
   __m128i even = _mm_mul_epu32(a, b);
   __m128i odd = _mm_mul_epu32(_mm_srli_si128(a, 4), _mm_srli_si128(b, 4));
@@ -2709,7 +2726,174 @@ static W1_UNUSED void w1_lf_simple_h(uint8_t *p, int s, int lim) {
     p++;
   }
 }
-static W1_UNUSED void w1_vp8_filter_mb(w1_vp8d_t *b, int mbx, int mby) {
+#ifdef W1_USE_SSE2
+/* The normal filter on 16 lanes at once: v[0..7] are p3..q3 across one
+ * edge (lanes are the pixels along it). Same arithmetic as the scalar
+ * port in the signed domain: saturating int8 adds are the clamp255 of the
+ * unsigned form, and 3*(q0-p0) + sat(p1-q1) accumulated with saturation
+ * equals the saturated sum because every step adds the same-signed term. */
+W1_FORCEINLINE __m128i w1_lf_abd(__m128i a, __m128i b) {
+  return _mm_or_si128(_mm_subs_epu8(a, b), _mm_subs_epu8(b, a));
+}
+W1_FORCEINLINE __m128i w1_lf_sra3(__m128i x) {
+  return _mm_packs_epi16(_mm_srai_epi16(_mm_unpacklo_epi8(x, x), 11),
+                         _mm_srai_epi16(_mm_unpackhi_epi8(x, x), 11));
+}
+W1_FORCEINLINE __m128i w1_lf_sra1(__m128i x) {
+  return _mm_packs_epi16(_mm_srai_epi16(_mm_unpacklo_epi8(x, x), 9),
+                         _mm_srai_epi16(_mm_unpackhi_epi8(x, x), 9));
+}
+/* (k * w + 63) >> 7 for int8 lanes w */
+W1_FORCEINLINE __m128i w1_lf_tap(__m128i wl, __m128i wh, int k) {
+  const __m128i kk = _mm_set1_epi16((short)k), r = _mm_set1_epi16(63);
+  return _mm_packs_epi16(
+      _mm_srai_epi16(_mm_add_epi16(_mm_mullo_epi16(wl, kk), r), 7),
+      _mm_srai_epi16(_mm_add_epi16(_mm_mullo_epi16(wh, kk), r), 7));
+}
+static W1_UNUSED void w1_lf_filter16(__m128i *v, int e, int ii, int hev_t,
+                                    int mb) {
+  const __m128i sgn = _mm_set1_epi8((char)0x80), zero = _mm_setzero_si128();
+  const __m128i lim = _mm_set1_epi8((char)(2 * e + ii));
+  const __m128i ilim = _mm_set1_epi8((char)ii);
+  const __m128i hth = _mm_set1_epi8((char)hev_t);
+  __m128i p1p0 = w1_lf_abd(v[2], v[3]), q1q0 = w1_lf_abd(v[5], v[4]);
+  __m128i m = _mm_max_epu8(_mm_max_epu8(w1_lf_abd(v[0], v[1]),
+                                        w1_lf_abd(v[1], v[2])),
+                           _mm_max_epu8(w1_lf_abd(v[7], v[6]),
+                                        w1_lf_abd(v[6], v[5])));
+  __m128i hq = _mm_max_epu8(p1p0, q1q0);
+  __m128i ad0 = w1_lf_abd(v[3], v[4]), ad1 = w1_lf_abd(v[2], v[5]);
+  __m128i mask, hev, ps1, ps0, qs0, qs1, a, f1, f2;
+  m = _mm_max_epu8(m, hq);
+  ad1 = _mm_and_si128(_mm_srli_epi16(ad1, 1), _mm_set1_epi8(0x7f));
+  ad0 = _mm_adds_epu8(_mm_adds_epu8(ad0, ad0), ad1);
+  mask = _mm_and_si128(_mm_cmpeq_epi8(_mm_subs_epu8(ad0, lim), zero),
+                       _mm_cmpeq_epi8(_mm_subs_epu8(m, ilim), zero));
+  if (_mm_movemask_epi8(mask) == 0) return;
+  hev = _mm_xor_si128(_mm_cmpeq_epi8(_mm_subs_epu8(hq, hth), zero),
+                      _mm_set1_epi8(-1));
+  ps1 = _mm_xor_si128(v[2], sgn); ps0 = _mm_xor_si128(v[3], sgn);
+  qs0 = _mm_xor_si128(v[4], sgn); qs1 = _mm_xor_si128(v[5], sgn);
+  {
+    const __m128i d = _mm_subs_epi8(qs0, ps0);
+    a = _mm_subs_epi8(ps1, qs1);
+    if (!mb) a = _mm_and_si128(a, hev);
+    a = _mm_adds_epi8(_mm_adds_epi8(_mm_adds_epi8(a, d), d), d);
+    a = _mm_and_si128(a, mask);
+  }
+  if (!mb) {
+    f1 = w1_lf_sra3(_mm_adds_epi8(a, _mm_set1_epi8(4)));
+    f2 = w1_lf_sra3(_mm_adds_epi8(a, _mm_set1_epi8(3)));
+    qs0 = _mm_subs_epi8(qs0, f1); ps0 = _mm_adds_epi8(ps0, f2);
+    a = _mm_andnot_si128(hev, w1_lf_sra1(_mm_adds_epi8(f1, _mm_set1_epi8(1))));
+    qs1 = _mm_subs_epi8(qs1, a); ps1 = _mm_adds_epi8(ps1, a);
+  } else {
+    const __m128i wh = _mm_and_si128(a, hev), wn = _mm_andnot_si128(hev, a);
+    __m128i lo, hi, ps2, qs2, t;
+    f1 = w1_lf_sra3(_mm_adds_epi8(wh, _mm_set1_epi8(4)));
+    f2 = w1_lf_sra3(_mm_adds_epi8(wh, _mm_set1_epi8(3)));
+    qs0 = _mm_subs_epi8(qs0, f1); ps0 = _mm_adds_epi8(ps0, f2);
+    lo = _mm_srai_epi16(_mm_unpacklo_epi8(wn, wn), 8);
+    hi = _mm_srai_epi16(_mm_unpackhi_epi8(wn, wn), 8);
+    t = w1_lf_tap(lo, hi, 27);
+    qs0 = _mm_subs_epi8(qs0, t); ps0 = _mm_adds_epi8(ps0, t);
+    t = w1_lf_tap(lo, hi, 18);
+    qs1 = _mm_subs_epi8(qs1, t); ps1 = _mm_adds_epi8(ps1, t);
+    t = w1_lf_tap(lo, hi, 9);
+    ps2 = _mm_adds_epi8(_mm_xor_si128(v[1], sgn), t);
+    qs2 = _mm_subs_epi8(_mm_xor_si128(v[6], sgn), t);
+    v[1] = _mm_xor_si128(ps2, sgn); v[6] = _mm_xor_si128(qs2, sgn);
+  }
+  v[2] = _mm_xor_si128(ps1, sgn); v[3] = _mm_xor_si128(ps0, sgn);
+  v[4] = _mm_xor_si128(qs0, sgn); v[5] = _mm_xor_si128(qs1, sgn);
+}
+/* Edge across rows (horizontal edge) at p: 16 lanes along x, or the 8 u
+ * lanes then the 8 v lanes when q8 is set. */
+static W1_UNUSED void w1_lf_h16(uint8_t *p, uint8_t *q8, int s, int e,
+                               int ii, int hev_t, int mb) {
+  __m128i v[8];
+  int k;
+  for (k = 0; k < 8; k++) {
+    if (q8)
+      v[k] = _mm_unpacklo_epi64(
+          _mm_loadl_epi64((const __m128i *)(p + (k - 4) * s)),
+          _mm_loadl_epi64((const __m128i *)(q8 + (k - 4) * s)));
+    else
+      v[k] = _mm_loadu_si128((const __m128i *)(p + (k - 4) * s));
+  }
+  w1_lf_filter16(v, e, ii, hev_t, mb);
+  for (k = 1; k < 7; k++) {
+    if (q8) {
+      _mm_storel_epi64((__m128i *)(p + (k - 4) * s), v[k]);
+      _mm_storel_epi64((__m128i *)(q8 + (k - 4) * s),
+                       _mm_unpackhi_epi64(v[k], v[k]));
+    } else {
+      _mm_storeu_si128((__m128i *)(p + (k - 4) * s), v[k]);
+    }
+  }
+}
+/* Edge across columns (vertical edge) at column p: rows 0-7 from p, rows
+ * 8-15 from p8 (p + 8 rows for luma, the v plane for chroma), transposed
+ * to 8 columns of 16 lanes and back. */
+static W1_UNUSED void w1_lf_v16(uint8_t *p, uint8_t *p8, int s, int e,
+                               int ii, int hev_t, int mb) {
+  __m128i r[16], a[8], b[8], c[8], v[8];
+  int k;
+  for (k = 0; k < 8; k++) {
+    r[k] = _mm_loadl_epi64((const __m128i *)(p + k * s - 4));
+    r[k + 8] = _mm_loadl_epi64((const __m128i *)(p8 + k * s - 4));
+  }
+  for (k = 0; k < 8; k++) a[k] = _mm_unpacklo_epi8(r[2 * k], r[2 * k + 1]);
+  for (k = 0; k < 4; k++) {
+    b[2 * k] = _mm_unpacklo_epi16(a[2 * k], a[2 * k + 1]);
+    b[2 * k + 1] = _mm_unpackhi_epi16(a[2 * k], a[2 * k + 1]);
+  }
+  /* b[0]/b[1]: rows 0-3 cols 0-3 / 4-7; b[2]/b[3] rows 4-7; ... */
+  for (k = 0; k < 2; k++) {
+    c[4 * k] = _mm_unpacklo_epi32(b[4 * k], b[4 * k + 2]);
+    c[4 * k + 1] = _mm_unpackhi_epi32(b[4 * k], b[4 * k + 2]);
+    c[4 * k + 2] = _mm_unpacklo_epi32(b[4 * k + 1], b[4 * k + 3]);
+    c[4 * k + 3] = _mm_unpackhi_epi32(b[4 * k + 1], b[4 * k + 3]);
+  }
+  /* c[0..3]: rows 0-7, column pairs (0,1) (2,3) (4,5) (6,7); c[4..7] rows 8-15 */
+  for (k = 0; k < 4; k++) {
+    v[2 * k] = _mm_unpacklo_epi64(c[k], c[k + 4]);
+    v[2 * k + 1] = _mm_unpackhi_epi64(c[k], c[k + 4]);
+  }
+  w1_lf_filter16(v, e, ii, hev_t, mb);
+  for (k = 0; k < 4; k++) {
+    a[2 * k] = _mm_unpacklo_epi8(v[2 * k], v[2 * k + 1]);
+    a[2 * k + 1] = _mm_unpackhi_epi8(v[2 * k], v[2 * k + 1]);
+  }
+  /* a[0]: rows 0-7 cols (0,1); a[1] rows 8-15; a[2] rows 0-7 cols (2,3) ... */
+  for (k = 0; k < 2; k++) {
+    b[4 * k] = _mm_unpacklo_epi16(a[k], a[k + 2]);
+    b[4 * k + 1] = _mm_unpackhi_epi16(a[k], a[k + 2]);
+    b[4 * k + 2] = _mm_unpacklo_epi16(a[k + 4], a[k + 6]);
+    b[4 * k + 3] = _mm_unpackhi_epi16(a[k + 4], a[k + 6]);
+  }
+  /* b[0]: rows 0-3 cols 0-3, b[1] rows 4-7 cols 0-3, b[2]/b[3] cols 4-7 */
+  for (k = 0; k < 2; k++) {
+    uint8_t *dst = k ? p8 : p;
+    const __m128i *bb = b + 4 * k;
+    __m128i t;
+    t = _mm_unpacklo_epi32(bb[0], bb[2]);
+    _mm_storel_epi64((__m128i *)(dst - 4), t);
+    _mm_storel_epi64((__m128i *)(dst + s - 4), _mm_unpackhi_epi64(t, t));
+    t = _mm_unpackhi_epi32(bb[0], bb[2]);
+    _mm_storel_epi64((__m128i *)(dst + 2 * s - 4), t);
+    _mm_storel_epi64((__m128i *)(dst + 3 * s - 4), _mm_unpackhi_epi64(t, t));
+    t = _mm_unpacklo_epi32(bb[1], bb[3]);
+    _mm_storel_epi64((__m128i *)(dst + 4 * s - 4), t);
+    _mm_storel_epi64((__m128i *)(dst + 5 * s - 4), _mm_unpackhi_epi64(t, t));
+    t = _mm_unpackhi_epi32(bb[1], bb[3]);
+    _mm_storel_epi64((__m128i *)(dst + 6 * s - 4), t);
+    _mm_storel_epi64((__m128i *)(dst + 7 * s - 4), _mm_unpackhi_epi64(t, t));
+  }
+}
+#endif
+static W1_UNUSED void w1_vp8_filter_mb_impl(w1_vp8d_t *b, int mbx, int mby,
+                                           int simd) {
   int idx = mby * b->mb_w + mbx;
   int seg = b->mb_seg[idx], ym = b->mb_ymode[idx];
   int flt = b->level, e, ii, hev;
@@ -2751,6 +2935,34 @@ static W1_UNUSED void w1_vp8_filter_mb(w1_vp8d_t *b, int mbx, int mby) {
     }
   } else {
     int sub = b->mb_eob[idx] || ym == W1_VP8_B;
+#ifdef W1_USE_SSE2
+    if (simd) {
+      const int ys = b->y_stride, uvs = b->uv_stride;
+      if (mbx) {
+        w1_lf_v16(yp, yp + 8 * ys, ys, e + 2, ii, hev, 1);
+        w1_lf_v16(up, vp, uvs, e + 2, ii, hev, 1);
+      }
+      if (sub) {
+        w1_lf_v16(yp + 4, yp + 8 * ys + 4, ys, e, ii, hev, 0);
+        w1_lf_v16(yp + 8, yp + 8 * ys + 8, ys, e, ii, hev, 0);
+        w1_lf_v16(yp + 12, yp + 8 * ys + 12, ys, e, ii, hev, 0);
+        w1_lf_v16(up + 4, vp + 4, uvs, e, ii, hev, 0);
+      }
+      if (mby) {
+        w1_lf_h16(yp, NULL, ys, e + 2, ii, hev, 1);
+        w1_lf_h16(up, vp, uvs, e + 2, ii, hev, 1);
+      }
+      if (sub) {
+        w1_lf_h16(yp + 4 * ys, NULL, ys, e, ii, hev, 0);
+        w1_lf_h16(yp + 8 * ys, NULL, ys, e, ii, hev, 0);
+        w1_lf_h16(yp + 12 * ys, NULL, ys, e, ii, hev, 0);
+        w1_lf_h16(up + 4 * uvs, vp + 4 * uvs, uvs, e, ii, hev, 0);
+      }
+      return;
+    }
+#else
+    (void)simd;
+#endif
     if (mbx) {
       w1_lf_mb_v(yp, b->y_stride, e + 2, ii, hev, 16);
       w1_lf_mb_v(up, b->uv_stride, e + 2, ii, hev, 8);
@@ -2776,6 +2988,13 @@ static W1_UNUSED void w1_vp8_filter_mb(w1_vp8d_t *b, int mbx, int mby) {
       w1_lf_sub_h(vp + 4 * b->uv_stride, b->uv_stride, e, ii, hev, 8);
     }
   }
+}
+static W1_UNUSED void w1_vp8_filter_mb(w1_vp8d_t *b, int mbx, int mby) {
+  w1_vp8_filter_mb_impl(b, mbx, mby, 1);
+}
+static W1_UNUSED void w1_vp8_filter_mb_scalar(w1_vp8d_t *b, int mbx,
+                                             int mby) {
+  w1_vp8_filter_mb_impl(b, mbx, mby, 0);
 }
 /* ---- Main VP8 decode entry ---- */
 
@@ -2986,10 +3205,82 @@ static W1_UNUSED void w1_fancy_px8_sse2(const uint8_t *y, const int *u,
     _mm_storeu_si128((__m128i *)(void *)(dst + 16), q1);
   }
 }
+/* w1_fancy_px for 8 pixels in 16-bit lanes: y8 is 8 luma bytes in the low
+ * half, u/v 8 chroma words (0..255). (x * k) >> 8 is mulhi(x << 8, k),
+ * exact for 8-bit x; r and g stay in int16, blue's sum can pass 32767 so it
+ * runs unsigned with the negative side saturated to 0 (clip8 gives 0
+ * there), and the final pack clamps to 0..255 like clip8. */
+static W1_UNUSED void w1_fancy_px8w_sse2(__m128i y8, __m128i u, __m128i v,
+                                         uint8_t *dst) {
+  const __m128i zero = _mm_setzero_si128();
+  __m128i yy = _mm_mulhi_epu16(_mm_unpacklo_epi8(zero, y8),
+                               _mm_set1_epi16(19077));
+  __m128i uu = _mm_slli_epi16(u, 8), vv = _mm_slli_epi16(v, 8);
+  __m128i r = _mm_srai_epi16(
+      _mm_sub_epi16(_mm_add_epi16(yy, _mm_mulhi_epu16(vv, _mm_set1_epi16(26149))),
+                    _mm_set1_epi16(14234)), 6);
+  __m128i g = _mm_srai_epi16(
+      _mm_add_epi16(_mm_sub_epi16(_mm_sub_epi16(yy,
+                        _mm_mulhi_epu16(uu, _mm_set1_epi16(6419))),
+                        _mm_mulhi_epu16(vv, _mm_set1_epi16(13320))),
+                    _mm_set1_epi16(8708)), 6);
+  __m128i b = _mm_srli_epi16(
+      _mm_subs_epu16(_mm_add_epi16(yy, _mm_mulhi_epu16(
+                         uu, _mm_set1_epi16((short)33050))),
+                     _mm_set1_epi16(17685)), 6);
+  __m128i rb = _mm_packus_epi16(r, b);            /* r0..7 b0..7 */
+  __m128i ga = _mm_packus_epi16(g, _mm_set1_epi16(255));
+  __m128i rg = _mm_unpacklo_epi8(rb, ga);          /* r g r g ... */
+  __m128i ba = _mm_unpackhi_epi8(rb, ga);          /* b a b a ... */
+  _mm_storeu_si128((__m128i *)(void *)dst, _mm_unpacklo_epi16(rg, ba));
+  _mm_storeu_si128((__m128i *)(void *)(dst + 16), _mm_unpackhi_epi16(rg, ba));
+}
+/* 16 interior pixels i..i+15 (i odd) of a row pair: chroma samples
+ * base..base+8 (base = (i-1)/2) of the two chroma rows, each pair (a b /
+ * c d) giving the four 9-3-3-1 taps of the scalar formulas. */
+static W1_UNUSED void w1_fancy_16_sse2(const uint8_t *top_y,
+                                       const uint8_t *bot_y,
+                                       const uint8_t *tu, const uint8_t *tv,
+                                       const uint8_t *cu, const uint8_t *cv,
+                                       uint8_t *top_dst, uint8_t *bot_dst) {
+  const __m128i zero = _mm_setzero_si128(), eight = _mm_set1_epi16(8);
+  __m128i ut[2], ub[2], vt[2], vb[2];
+  int pl;
+  for (pl = 0; pl < 2; pl++) {
+    const uint8_t *t = pl ? tv : tu, *c = pl ? cv : cu;
+    __m128i a = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)(const void *)t), zero);
+    __m128i b = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)(const void *)(t + 1)), zero);
+    __m128i cc = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)(const void *)c), zero);
+    __m128i d = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)(const void *)(c + 1)), zero);
+    __m128i sum = _mm_add_epi16(_mm_add_epi16(a, b), _mm_add_epi16(cc, d));
+    __m128i s8 = _mm_add_epi16(sum, eight);
+    __m128i d12 = _mm_srli_epi16(
+        _mm_add_epi16(s8, _mm_slli_epi16(_mm_add_epi16(b, cc), 1)), 3);
+    __m128i d03 = _mm_srli_epi16(
+        _mm_add_epi16(s8, _mm_slli_epi16(_mm_add_epi16(a, d), 1)), 3);
+    __m128i te = _mm_srli_epi16(_mm_add_epi16(d12, a), 1);
+    __m128i to = _mm_srli_epi16(_mm_add_epi16(d03, b), 1);
+    __m128i be = _mm_srli_epi16(_mm_add_epi16(d03, cc), 1);
+    __m128i bo = _mm_srli_epi16(_mm_add_epi16(d12, d), 1);
+    __m128i *T = pl ? vt : ut, *B = pl ? vb : ub;
+    T[0] = _mm_unpacklo_epi16(te, to); T[1] = _mm_unpackhi_epi16(te, to);
+    B[0] = _mm_unpacklo_epi16(be, bo); B[1] = _mm_unpackhi_epi16(be, bo);
+  }
+  w1_fancy_px8w_sse2(_mm_loadl_epi64((const __m128i *)(const void *)top_y),
+                     ut[0], vt[0], top_dst);
+  w1_fancy_px8w_sse2(_mm_loadl_epi64((const __m128i *)(const void *)(top_y + 8)),
+                     ut[1], vt[1], top_dst + 32);
+  if (bot_y) {
+    w1_fancy_px8w_sse2(_mm_loadl_epi64((const __m128i *)(const void *)bot_y),
+                       ub[0], vb[0], bot_dst);
+    w1_fancy_px8w_sse2(_mm_loadl_epi64((const __m128i *)(const void *)(bot_y + 8)),
+                       ub[1], vb[1], bot_dst + 32);
+  }
+}
 /* Fancy-upsample a chroma row pair and convert, mirroring w1_fancy_pair.
  * Direct per-pixel chroma formulas are algebraically identical to the
- * scalar recursion; groups of 8 interior pixels go through w1_fancy_px8_sse2
- * and the boundary pixels use the scalar reference. */
+ * scalar recursion; groups of 16 then 8 interior pixels go through the
+ * SIMD paths and the boundary pixels use the scalar reference. */
 static W1_UNUSED void w1_fancy_pair_sse2(
     const uint8_t *top_y, const uint8_t *bot_y, const uint8_t *top_u,
     const uint8_t *top_v, const uint8_t *cur_u, const uint8_t *cur_v,
@@ -3003,7 +3294,14 @@ static W1_UNUSED void w1_fancy_pair_sse2(
       w1_fancy_px(bot_y[0], (3 * cu + tu + 2) >> 2, (3 * cv + tv + 2) >> 2,
                   bot_dst);
   }
-  for (i = 1; i + 7 <= pend; i += 8) {
+  for (i = 1; i + 15 <= pend; i += 16) {
+    const int base = (i - 1) >> 1;
+    w1_fancy_16_sse2(top_y + i, bot_y ? bot_y + i : NULL, top_u + base,
+                     top_v + base, cur_u + base, cur_v + base,
+                     top_dst + (size_t)i * 4,
+                     bot_y ? bot_dst + (size_t)i * 4 : NULL);
+  }
+  for (; i + 7 <= pend; i += 8) {
     int j, ub[8], vb[8], ubb[8], vbb[8];
     int base = (i - 1) >> 1;
     for (j = 0; j < 4; j++) {
@@ -3051,16 +3349,10 @@ static W1_UNUSED void w1_fancy_pair_sse2(
   }
 }
 #endif
-static W1_UNUSED void w1_fancy_pair(const uint8_t *top_y,
-                                   const uint8_t *bot_y,
-                                   const uint8_t *top_u, const uint8_t *top_v,
-                                   const uint8_t *cur_u, const uint8_t *cur_v,
-                                   uint8_t *top_dst, uint8_t *bot_dst,
-                                   int len) {
-#ifdef W1_USE_SSE2
-  w1_fancy_pair_sse2(top_y, bot_y, top_u, top_v, cur_u, cur_v, top_dst,
-                     bot_dst, len);
-#else
+static W1_UNUSED void w1_fancy_pair_scalar(
+    const uint8_t *top_y, const uint8_t *bot_y, const uint8_t *top_u,
+    const uint8_t *top_v, const uint8_t *cur_u, const uint8_t *cur_v,
+    uint8_t *top_dst, uint8_t *bot_dst, int len) {
   int x, last = (len - 1) >> 1;
   int tl_u = top_u[0], tl_v = top_v[0], l_u = cur_u[0], l_v = cur_v[0];
   w1_fancy_px(top_y[0], (3 * tl_u + l_u + 2) >> 2,
@@ -3093,6 +3385,19 @@ static W1_UNUSED void w1_fancy_pair(const uint8_t *top_y,
       w1_fancy_px(bot_y[len - 1], (3 * l_u + tl_u + 2) >> 2,
                   (3 * l_v + tl_v + 2) >> 2, bot_dst + (len - 1) * 4);
   }
+}
+static W1_UNUSED void w1_fancy_pair(const uint8_t *top_y,
+                                   const uint8_t *bot_y,
+                                   const uint8_t *top_u, const uint8_t *top_v,
+                                   const uint8_t *cur_u, const uint8_t *cur_v,
+                                   uint8_t *top_dst, uint8_t *bot_dst,
+                                   int len) {
+#ifdef W1_USE_SSE2
+  w1_fancy_pair_sse2(top_y, bot_y, top_u, top_v, cur_u, cur_v, top_dst,
+                     bot_dst, len);
+#else
+  w1_fancy_pair_scalar(top_y, bot_y, top_u, top_v, cur_u, cur_v, top_dst,
+                       bot_dst, len);
 #endif
 }
 static W1_UNUSED void w1_vp8_yuv_to_rgba(const w1_vp8_frame_t *f,
@@ -3996,17 +4301,26 @@ static W1_UNUSED void w1_prefix_inv(int v, int *code, int *extra, int *ebits) {
   *extra = (v - 1) & ((1 << *ebits) - 1);
 }
 
-/* Distance -> plane value (plane code 1..120 or dist+120). */
+/* Distance -> plane value (plane code 1..120 or dist+120). The decoder
+ * maps a code to dx + dy*w, so one distance can have several (dx, dy)
+ * spellings: the canonical 0 <= dx < w, and one row further down with
+ * dx - w < 0 (up-and-right: dist w-1 is code 4, not dist+120). Frames of
+ * width 8 or less have more. Take the smallest code. */
 static W1_UNUSED int w1_dist_plane(int dist, int w) {
-  int yoff = dist / w, xoff = dist - yoff * w;
-  if (yoff < 8 && xoff >= 0 && xoff <= 8) {
-    int p = (int)w1k_vp8l_plane_rev[yoff][xoff + 8];
-    if (p >= 1 && p <= 120 &&
+  int yoff = dist / w, best = dist + 120;
+  int dy = yoff > 8 ? yoff - 8 : 0, dy_end = w > 8 ? yoff + 1 : 7;
+  if (w > 8 && dy < yoff) dy = yoff;
+  for (; dy <= dy_end && dy < 8; dy++) {
+    const int dx = dist - dy * w;
+    int p;
+    if (dx < -8 || dx > 8) continue;
+    p = (int)w1k_vp8l_plane_rev[dy][dx + 8];
+    if (p >= 1 && p < best &&
         (int)w1k_vp8l_plane_dx[p - 1] +
         (int)w1k_vp8l_plane_dy[p - 1] * w == dist)
-      return p;
+      best = p;
   }
-  return dist + 120;
+  return best;
 }
 
 /* counts[0..n-1] -> lens[] (0 = unused). tmp needs 5*n ints.
@@ -4015,37 +4329,36 @@ static W1_UNUSED int w1_huff_node_less(const int *freq, int a, int b) {
   return freq[a] < freq[b] || (freq[a] == freq[b] && a < b);
 }
 
-static W1_UNUSED void w1_huff_sort_nodes(int *order, int m,
-                                         const int *freq) {
-  int start, end;
-  for (start = m / 2 - 1; start >= 0; start--) {
-    int root = start;
-    for (;;) {
-      int child = root * 2 + 1, swap = root, t;
-      if (child >= m) break;
-      if (w1_huff_node_less(freq, order[swap], order[child])) swap = child;
-      if (child + 1 < m &&
-          w1_huff_node_less(freq, order[swap], order[child + 1]))
-        swap = child + 1;
-      if (swap == root) break;
-      t = order[root]; order[root] = order[swap]; order[swap] = t;
-      root = swap;
+/* order[0..m-1] = the counted symbols sorted by (freq, index). order[]
+ * is rebuilt in index order and sorted stably (insertion sort for short
+ * lists, LSD radix on the freq bytes otherwise), so equal frequencies
+ * keep index order: the one total order every caller relies on. scratch
+ * holds m ints. */
+static W1_UNUSED void w1_huff_sort_nodes(int *order, int m, const int *freq,
+                                         const int *counts, int n,
+                                         int max_freq, int *scratch) {
+  int i, k = 0;
+  for (i = 0; i < n; i++) if (counts[i] > 0) order[k++] = i;
+  if (m <= 32) {
+    for (i = 1; i < m; i++) {
+      int v = order[i], fv = freq[v], j = i;
+      while (j > 0 && freq[order[j - 1]] > fv) { order[j] = order[j - 1]; j--; }
+      order[j] = v;
     }
+    return;
   }
-  for (end = m - 1; end > 0; end--) {
-    int root = 0, t = order[0];
-    order[0] = order[end]; order[end] = t;
-    for (;;) {
-      int child = root * 2 + 1, swap = root;
-      if (child >= end) break;
-      if (w1_huff_node_less(freq, order[swap], order[child])) swap = child;
-      if (child + 1 < end &&
-          w1_huff_node_less(freq, order[swap], order[child + 1]))
-        swap = child + 1;
-      if (swap == root) break;
-      t = order[root]; order[root] = order[swap]; order[swap] = t;
-      root = swap;
+  {
+    int *src = order, *dst = scratch, shift;
+    for (shift = 0; shift < 32 && ((unsigned)max_freq >> shift); shift += 8) {
+      int cnt[256], *t, acc = 0;
+      for (i = 0; i < 256; i++) cnt[i] = 0;
+      for (i = 0; i < m; i++) cnt[((unsigned)freq[src[i]] >> shift) & 255]++;
+      for (i = 0; i < 256; i++) { int c = cnt[i]; cnt[i] = acc; acc += c; }
+      for (i = 0; i < m; i++)
+        dst[cnt[((unsigned)freq[src[i]] >> shift) & 255]++] = src[i];
+      t = src; src = dst; dst = t;
     }
+    if (src != order) memcpy(order, src, (size_t)m * sizeof(int));
   }
 }
 
@@ -4058,51 +4371,83 @@ static W1_UNUSED int w1_huff_pop_node(const int *freq, const int *order,
   return (*inner)++;
 }
 
+/* One Huffman tree over the counts raised to floor_min (see
+ * w1_huff_lengths): lens[] of the m counted symbols, order[] (tmp + 4n)
+ * left sorted. Returns the deepest length. */
+static W1_UNUSED int w1_huff_tree(const int *counts, int n, int m,
+                                  int max_count, int64_t floor_min,
+                                  uint8_t *lens, int *tmp) {
+  int *freq = tmp, *parent = tmp + 2 * n, *order = tmp + 4 * n;
+  int next = n, inner = n, leaf = 0, a, b, max_depth = 0, i, k;
+  for (i = 0; i < n; i++)
+    if (counts[i] > 0)
+      freq[i] = counts[i] < floor_min ? (int)floor_min : counts[i];
+  w1_huff_sort_nodes(order, m, freq, counts, n, max_count, parent);
+  for (k = 0; k < m - 1; k++) {
+    a = w1_huff_pop_node(freq, order, m, &leaf, &inner, next);
+    b = w1_huff_pop_node(freq, order, m, &leaf, &inner, next);
+    freq[next] = freq[a] + freq[b]; parent[a] = next; parent[next] = -1;
+    parent[b] = next; next++;
+  }
+  /* Depths top-down: every inner node's parent was created after it, so
+   * one reverse sweep fills freq[n..next) with depths (freq is spent). */
+  freq[next - 1] = 0;
+  for (i = next - 2; i >= n; i--) freq[i] = freq[parent[i]] + 1;
+  for (i = 0; i < m; i++) {
+    int depth = freq[parent[order[i]]] + 1;
+    lens[order[i]] = (uint8_t)depth;
+    if (depth > max_depth) max_depth = depth;
+  }
+  return max_depth;
+}
+
+/* All counts level: the complete almost-uniform tree over order[] (m is at
+ * most the alphabet size, so it always fits max_len here). */
+static W1_UNUSED void w1_huff_uniform(const int *order, int m, int max_len,
+                                      uint8_t *lens) {
+  int bits = 0, r, i;
+  while ((m - 1) >> bits) bits++;
+  if (bits > max_len) bits = max_len;
+  r = (1 << bits) - m;
+  for (i = 0; i < m; i++)
+    lens[order[i]] = (uint8_t)(i < r ? bits - 1 : bits);
+}
+
+/* Counted symbols (m) and the largest count; lens[] cleared. */
+static W1_UNUSED int w1_huff_count(const int *counts, int n, uint8_t *lens,
+                                   int *max_count) {
+  int i, m = 0;
+  *max_count = 1;
+  for (i = 0; i < n; i++) {
+    lens[i] = 0;
+    if (counts[i] > 0) {
+      m++;
+      if (counts[i] > *max_count) *max_count = counts[i];
+    }
+  }
+  return m;
+}
+
 static W1_UNUSED int w1_huff_lengths(const int *counts, int n, int max_len,
                                      uint8_t *lens, int *tmp) {
-  int *freq = tmp, *parent = tmp + 2 * n, *order = tmp + 4 * n;
-  int i, m = 0, k, max_count = 1;
+  int i, m, max_count;
   int64_t floor_min = 1;
-  for (i = 0; i < n; i++) lens[i] = 0;
-  for (i = 0; i < n; i++) if (counts[i] > 0) {
-    order[m++] = i;
-    if (counts[i] > max_count) max_count = counts[i];
-  }
+  m = w1_huff_count(counts, n, lens, &max_count);
   if (m == 0) return 0;
-  if (m == 1) { lens[order[0]] = 1; return 1; }
+  if (m == 1) {
+    for (i = 0; i < n; i++) if (counts[i] > 0) lens[i] = 1;
+    return 1;
+  }
   /* Raising every small count to a common floor shortens the tree until it
    * fits max_len (count-floor optimal length-limited tree). Unlike clamping plus an
    * integer Kraft repair, every trial is a real Huffman tree, so the codes
    * always form a complete tree the decoder accepts. */
   for (;;) {
-    int next = n, inner = n, leaf = 0, a, b, max_depth = 0;
-    for (i = 0; i < n; i++)
-      if (counts[i] > 0)
-        freq[i] = counts[i] < floor_min ? (int)floor_min : counts[i];
-    w1_huff_sort_nodes(order, m, freq);
-    for (k = 0; k < m - 1; k++) {
-      a = w1_huff_pop_node(freq, order, m, &leaf, &inner, next);
-      b = w1_huff_pop_node(freq, order, m, &leaf, &inner, next);
-      freq[next] = freq[a] + freq[b]; parent[a] = next; parent[next] = -1;
-      parent[b] = next; next++;
-    }
-    for (i = 0; i < m; i++) {
-      int depth = 0, p = order[i], root = next - 1;
-      while (p != root) { p = parent[p]; depth++; }
-      if (depth < 1) depth = 1;
-      lens[order[i]] = (uint8_t)depth;
-      if (depth > max_depth) max_depth = depth;
-    }
-    if (max_depth <= max_len) break;
+    if (w1_huff_tree(counts, n, m, max_count, floor_min, lens, tmp) <=
+        max_len)
+      break;
     if (floor_min >= max_count) {
-      /* All counts level: use the complete almost-uniform tree (m is at
-       * most the alphabet size, so it always fits max_len here). */
-      int bits = 0, r;
-      while ((m - 1) >> bits) bits++;
-      if (bits > max_len) bits = max_len;
-      r = (1 << bits) - m;
-      for (i = 0; i < m; i++)
-        lens[order[i]] = (uint8_t)(i < r ? bits - 1 : bits);
+      w1_huff_uniform(tmp + 4 * n, m, max_len, lens);
       break;
     }
     floor_min *= 2;
@@ -4228,11 +4573,14 @@ static W1_UNUSED int w1_huff_rle_optimized(const uint8_t *lens, int last,
   return cnt;
 }
 
+/* Close a token run covering symbols 0..last. with_len signals max_symbol
+ * (the token count) so the zero tail is implied; otherwise the tail is
+ * spelled out with 17/18 runs. max_symbol needs >= 2 tokens. */
 static W1_UNUSED int w1_huff_rle_finish(int n, int last, int *ssym,
-                                        int *sext, int cnt, int *use_len,
-                                        int *max_sym) {
+                                        int *sext, int cnt, int with_len,
+                                        int *use_len, int *max_sym) {
   *max_sym = cnt;
-  *use_len = cnt < n;
+  *use_len = with_len && cnt < n;
   if (!*use_len || cnt < 2) {
     int r = n - 1 - last;
     *use_len = 0;
@@ -4265,6 +4613,23 @@ static W1_UNUSED uint64_t w1_huff_rle_bits(const int *ssym,
   return bits;
 }
 
+/* Exact header bits of a finished token run under the code-length code it
+ * induces; leaves that code in cl_lens / *cl_nz. htmp needs 5*19 ints. */
+static W1_UNUSED uint64_t w1_huff_rle_cost(const int *ssym, int cnt,
+                                           int use_len, int max_sym,
+                                           uint8_t *cl_lens, int *cl_nz,
+                                           int *htmp) {
+  int cl_counts[19], k, ncl = 4;
+  for (k = 0; k < 19; k++) cl_counts[k] = 0;
+  for (k = 0; k < cnt; k++) cl_counts[ssym[k]]++;
+  *cl_nz = w1_huff_lengths(cl_counts, 19, 7, cl_lens, htmp);
+  for (k = 18; k >= 0; k--)
+    if (cl_lens[w1k_vp8l_cl_order[k]]) { ncl = k + 1; break; }
+  if (ncl < 4) ncl = 4;
+  return w1_huff_rle_bits(ssym, cl_lens, cnt, ncl, *cl_nz, use_len,
+                          max_sym);
+}
+
 /* Emit one Huffman table (simple or normal path). seq needs 2*n ints. */
 static W1_UNUSED void w1_huff_emit(w1_bw_t *bw, const uint8_t *lens, int n,
                                    int *seq) {
@@ -4285,46 +4650,36 @@ static W1_UNUSED void w1_huff_emit(w1_bw_t *bw, const uint8_t *lens, int n,
   }
   {
     int last = n - 1, cnt, use_len, max_sym, ncl, k, cl_nz;
-    int cl_counts[19], cl_codes[19], htmp[5 * 19];
-    uint8_t cl_lens[19];
-    uint64_t chosen_bits;
+    int cl_codes[19], htmp[5 * 19];
+    uint8_t cl_lens[19], seed[19];
+    uint64_t chosen_bits = ~(uint64_t)0;
+    int src, fin, best_src = 0, best_fin = 1;
     while (last > 0 && lens[last] == 0) last--;
-    cnt = w1_huff_rle_greedy(lens, last, ssym, sext);
-    cnt = w1_huff_rle_finish(n, last, ssym, sext, cnt, &use_len, &max_sym);
-    for (k = 0; k < 19; k++) cl_counts[k] = 0;
-    for (k = 0; k < cnt; k++) cl_counts[ssym[k]]++;
-    cl_nz = w1_huff_lengths(cl_counts, 19, 7, cl_lens, htmp);
-    {
-      uint64_t original_bits, candidate_bits;
-      int original_ncl = 4, candidate_ncl, candidate_nz;
-      for (k = 18; k >= 0; k--)
-        if (cl_lens[w1k_vp8l_cl_order[k]]) { original_ncl = k + 1; break; }
-      if (original_ncl < 4) original_ncl = 4;
-      original_bits = w1_huff_rle_bits(ssym, cl_lens, cnt, original_ncl,
-          cl_nz, use_len, max_sym);
-      cnt = w1_huff_rle_optimized(lens, last, cl_lens, ssym, sext);
-      cnt = w1_huff_rle_finish(n, last, ssym, sext, cnt, &use_len, &max_sym);
-      for (k = 0; k < 19; k++) cl_counts[k] = 0;
-      for (k = 0; k < cnt; k++) cl_counts[ssym[k]]++;
-      candidate_nz = w1_huff_lengths(cl_counts, 19, 7, cl_lens, htmp);
-      candidate_ncl = 4;
-      for (k = 18; k >= 0; k--)
-        if (cl_lens[w1k_vp8l_cl_order[k]]) { candidate_ncl = k + 1; break; }
-      if (candidate_ncl < 4) candidate_ncl = 4;
-      candidate_bits = w1_huff_rle_bits(ssym, cl_lens, cnt, candidate_ncl,
-          candidate_nz, use_len, max_sym);
-      if (candidate_bits >= original_bits) {
-        cnt = w1_huff_rle_greedy(lens, last, ssym, sext);
-        cnt = w1_huff_rle_finish(n, last, ssym, sext, cnt, &use_len, &max_sym);
-        for (k = 0; k < 19; k++) cl_counts[k] = 0;
-        for (k = 0; k < cnt; k++) cl_counts[ssym[k]]++;
-        cl_nz = w1_huff_lengths(cl_counts, 19, 7, cl_lens, htmp);
-        chosen_bits = original_bits;
-      } else {
-        cl_nz = candidate_nz;
-        chosen_bits = candidate_bits;
+    /* Candidates: greedy runs, and runs re-optimised under the greedy
+     * max_symbol-closed CL code; each closed by max_symbol or by spelling
+     * the zero tail, whichever costs fewer exact bits. max_symbol costs
+     * 8+ bits, so it loses when the tail is short or empty (stripes_h-256:
+     * tokens end on symbol 279, 64 -> 57 header bits). */
+    for (src = 0; src < 2; src++)
+      for (fin = 1; fin >= 0; fin--) {
+        uint64_t bits;
+        cnt = src ? w1_huff_rle_optimized(lens, last, seed, ssym, sext)
+                  : w1_huff_rle_greedy(lens, last, ssym, sext);
+        cnt = w1_huff_rle_finish(n, last, ssym, sext, cnt, fin, &use_len,
+                                 &max_sym);
+        bits = w1_huff_rle_cost(ssym, cnt, use_len, max_sym, cl_lens,
+                                &cl_nz, htmp);
+        if (!src && fin) memcpy(seed, cl_lens, sizeof(seed));
+        if (bits < chosen_bits) {
+          chosen_bits = bits; best_src = src; best_fin = fin;
+        }
       }
-    }
+    cnt = best_src ? w1_huff_rle_optimized(lens, last, seed, ssym, sext)
+                   : w1_huff_rle_greedy(lens, last, ssym, sext);
+    cnt = w1_huff_rle_finish(n, last, ssym, sext, cnt, best_fin, &use_len,
+                             &max_sym);
+    (void)w1_huff_rle_cost(ssym, cnt, use_len, max_sym, cl_lens, &cl_nz,
+                           htmp);
     /* All-literal candidate: when every nonzero length is equal (near-uniform
      * symbol counts), one code-length symbol covers the whole alphabet and a
      * single-symbol CL tree codes each of the n entries in 0 bits, so the
@@ -4390,13 +4745,34 @@ static W1_UNUSED void w1_huff_emit(w1_bw_t *bw, const uint8_t *lens, int n,
  * a count floor in w1_huff_lengths, i.e. a progressively flatter real tree,
  * so the sweep from the free Huffman depth down to the uniform depth is a
  * one-parameter family; payload + emitted header bits picks the member.
- * best holds n bytes of scratch for the winner. */
+ * best holds n bytes of scratch for the winner.
+ * The tree at a given floor does not depend on the limit, and each limit
+ * takes the first floor (1, 2, 4, ... max count) whose tree fits it, so the
+ * sweep walks the floor sequence once instead of restarting it per limit
+ * (same lengths as w1_huff_lengths(counts, n, limit) at every limit). */
 static W1_UNUSED int w1_huff_lengths_hdr(const int *counts, int n,
                                          uint8_t *lens, int *tmp, int *seq,
                                          uint8_t *best) {
-  int m, i, limit, maxd = 0, floor_d = 0;
+  int m, i, limit, maxd = 0, floor_d = 0, max_count, depth, uni = 0;
+  int64_t floor_min = 1;
   uint64_t best_bits;
-  m = w1_huff_lengths(counts, n, 15, lens, tmp);
+  m = w1_huff_count(counts, n, lens, &max_count);
+  if (m == 0) return 0;
+  if (m == 1) {
+    for (i = 0; i < n; i++) if (counts[i] > 0) lens[i] = 1;
+    return 1;
+  }
+  depth = w1_huff_tree(counts, n, m, max_count, floor_min, lens, tmp);
+  while (depth > 15) {
+    if (floor_min >= max_count) {
+      w1_huff_uniform(tmp + 4 * n, m, 15, lens);
+      uni = 1;
+      break;
+    }
+    floor_min *= 2;
+    if (floor_min > max_count) floor_min = max_count;
+    depth = w1_huff_tree(counts, n, m, max_count, floor_min, lens, tmp);
+  }
   if (m <= 2) return m;
   for (i = 0; i < n; i++) if (lens[i] > maxd) maxd = lens[i];
   while ((m - 1) >> floor_d) floor_d++;
@@ -4413,7 +4789,26 @@ static W1_UNUSED int w1_huff_lengths_hdr(const int *counts, int n,
   for (limit = maxd - 1; limit >= floor_d; limit--) {
     uint64_t bits;
     w1_bw_t bw;
-    w1_huff_lengths(counts, n, limit, lens, tmp);
+    int changed = 0;
+    if (uni) {
+      w1_huff_uniform(tmp + 4 * n, m, limit, lens);
+      changed = 1;
+    } else {
+      while (depth > limit) {
+        changed = 1;
+        if (floor_min >= max_count) {
+          w1_huff_uniform(tmp + 4 * n, m, limit, lens);
+          uni = 1;
+          break;
+        }
+        floor_min *= 2;
+        if (floor_min > max_count) floor_min = max_count;
+        depth = w1_huff_tree(counts, n, m, max_count, floor_min, lens, tmp);
+      }
+    }
+    /* Unchanged lengths score the bits already scored: never strictly
+     * better. */
+    if (!changed) continue;
     w1_bw_init(&bw, NULL, 0);
     w1_huff_emit(&bw, lens, n, seq);
     bits = (uint64_t)bw.bytes * 8 + (uint64_t)bw.nbits;
@@ -4427,23 +4822,36 @@ static W1_UNUSED int w1_huff_lengths_hdr(const int *counts, int n,
 #define W1_LE_MAX_DIST 1048456
 #define W1_LE_MAX_LEN 4096
 #define W1_LE_INF 0x3fffffff
-#ifndef W1_LZ_OPT_MAXN
-#define W1_LZ_OPT_MAXN 16384
-#endif
 /* Soft price (bits) the DP charges for a symbol the current lens leave
  * uncoded; the support loop then adds whatever the parse actually used. */
 #ifndef W1_LZ_OPT_ABSENT
 #define W1_LZ_OPT_ABSENT 16
 #endif
 #define W1_LZ_OPT_NC 6
+/* Level-9 portfolio: how many of the best greedy-screened runs are finished
+ * under the optimal parse, and how far (1/1024 of the best screen size)
+ * behind the best one may be and still be finished. */
+#ifndef W1_LZ_OPT_FINALISTS
+#define W1_LZ_OPT_FINALISTS 3
+#endif
+#ifndef W1_LZ_OPT_MARGIN
+#define W1_LZ_OPT_MARGIN 10
+#endif
 #ifndef W1_LZ_OPT_LEVEL
 #define W1_LZ_OPT_LEVEL 9
 #endif
-#ifndef W1_LE_UNI_PORTFOLIO_MAXN
-#define W1_LE_UNI_PORTFOLIO_MAXN 16384
-#endif
 #ifndef W1_LE_UNI_PORTFOLIO_K
 #define W1_LE_UNI_PORTFOLIO_K 2
+#endif
+#ifndef W1_LE_UNI_SB
+#define W1_LE_UNI_SB 9
+#endif
+/* Estimate depth of the uniform-mode ranking. It only picks which modes
+ * the portfolio encodes as finished streams, and depth 0, 1 and the full
+ * level all pick the same streams on the real corpus and the 64-512 grid,
+ * while the full depth doubles the rank-only run (1.3 s at 1280x1040). */
+#ifndef W1_LE_UNI_RANK_SL
+#define W1_LE_UNI_RANK_SL 1
 #endif
 
 #define W1_LE_NG 2328
@@ -4507,6 +4915,11 @@ typedef struct {
 /* Searches sampled with the chain walk before choosing it for the rest of
  * the fill; the scatter is only built when the sampled hop rate (chain
  * steps per search) says the sequential walk will pay it back. */
+/* Prepares a never re-read match table may sit idle before it is the
+ * first fill victim (see w1_le_ctx_t). */
+#ifndef W1_LZ_TAB_STALE
+#define W1_LZ_TAB_STALE 4
+#endif
 #ifndef W1_LZ_SAMPLE
 #define W1_LZ_SAMPLE 4096
 #endif
@@ -4518,26 +4931,78 @@ typedef struct {
 #define W1_LZ_LIST_MINHOP 32
 #endif
 
+#define W1_LE_MAXTIES 16
+
+/* Level-9 predict memo (w1_vp8l_encode_full). w1_le_predict's modes, ties
+ * and residual depend only on (src pixels, w, h, sb, bonus), and the
+ * portfolio's runs repeat the same tile-size searches on the same images:
+ * stripes_v 1024 makes 13 predict calls on 6 inputs, palette16 49 on 10,
+ * text 16 on 4. A hit copies the modes and ties and rebuilds the residual
+ * one mode per tile instead of scoring 14. Slots fill first come, first
+ * kept; each holds an sb 3 grid of modes. */
+#define W1_LE_PM_SLOTS 12
+typedef struct {
+  int n;                       /* slots filled */
+  size_t cap;                  /* mode bytes per slot */
+  struct {
+    uint64_t sum;
+    int w, h, sb, bonus, nties;
+    uint8_t *modes;
+    int ties[W1_LE_MAXTIES * 2];
+  } s[W1_LE_PM_SLOTS];
+} w1_le_pmemo_t;
+
+/* Level-9 final-stream memo (w1_vp8l_encode_full). The finals re-encode
+ * the top candidates with the optimal parse, and different pins often
+ * leave the same main image: stripes_v 1024 streams one residual at levels
+ * 6, 8, 6, text the same one three times, each ~4 DP passes. w1_le_stream's
+ * bits depend only on the pixels, dims, level, depth, cache bits, the
+ * present set and the counts it starts its tables from, so a repeat
+ * replays the recorded bits and restores the counts, lengths and codes it
+ * left behind. Slots hold up to 1 bit per pixel. */
+#define W1_LE_SM_SLOTS 2
+typedef struct {
+  int n;                       /* slots filled */
+  size_t cap;                  /* recorded bytes per slot */
+  struct {
+    uint64_t key, nbits;
+    int w, h, level, depth, cache_bits;
+    uint8_t *bits, *lens;
+    int *counts, *codes;
+  } s[W1_LE_SM_SLOTS];
+} w1_le_smemo_t;
+
+#define W1_LZ_SMALL_N 4096
+
 /* Encoder scratch context (carved from the bump once per encode). */
 typedef struct {
   int max_n;
   /* Per-position best-match tables (w1_lz_fill), two slots so a sub-image
    * pass between two passes over the main image does not evict the main
    * table. A slot is identified by the geometry, the search budget and the
-   * content hash of the array it was filled for. The fill victim is the
-   * slot whose cache is worth least: tab_uses (hits since the fill) times
-   * the pixels a refill would re-search, with tab_lru breaking ties by
-   * recency. A table nothing has re-read yet (worth 0) is evicted before
-   * one many passes read, and among re-read tables the bigger refill is
-   * kept. */
+   * content hash of the array it was filled for. The fill victim is, in
+   * order: a table nothing re-read that has sat through W1_LZ_TAB_STALE
+   * prepares (the array was replaced, e.g. by its palette-packed form);
+   * the smaller table (the cheaper refill: sub-images are 1/16..1/1024 of
+   * the main image); the least recently used one (tab_lru). Weighting by
+   * hits alone evicted a main-image table that had just been filled (0
+   * hits) for the first sub-image pass after it. */
   uint32_t *tab[2];
   /* Runner-up tables (same slots, DP only, NULL otherwise): the closer,
    * shorter match the longest-match rule displaced (or the nearest chain
    * candidate), whose distance code is often far cheaper. */
   uint32_t *near[2];
   int tab_n[2], tab_w[2], tab_iters[2], tab_valid[2], tab_lru;
+  int tab_hit[2];              /* re-read since the fill */
+  uint32_t tab_last[2], tab_clock;   /* prepare count at the last use */
   uint64_t tab_hash[2];
-  uint32_t tab_uses[2];
+  /* Small slot: arrays of at most W1_LZ_SMALL_N pixels and 1/16 of the
+   * main image (palette tables, coarse mode images) fill here instead of
+   * evicting a main-size table (text 1024 L8: the 2-pixel palette table
+   * evicted the 131K-pixel index table, refilled at 22 Mcycles). */
+  uint32_t *tab_s, *near_s;
+  int tab_s_n, tab_s_w, tab_s_iters, tab_s_valid;
+  uint64_t tab_s_hash;
   w1_lz_cand_t cand;           /* shared fill scratch (w1_lz_cand_t) */
   w1_le_tk_t tk[2];            /* recorded parses (w1_le_stream trials) */
   int *counts;                 /* 2328 + 256*3 + 40 */
@@ -4549,6 +5014,16 @@ typedef struct {
    * report the branch's uniform-mode ranking back to the portfolio. */
   int uni_force, uni_n, uni_rank[14];
   uint64_t uni_est[14];
+  /* Public level 9: turns on the searches reserved for it (pick_sb, the
+   * smooth-frame trial). Separate from the run's level because the level-9
+   * portfolio encodes at levels 6 and 8. */
+  int l9;
+  /* Rank-only run (w1_vp8l_encode_full): rank the uniform modes in the
+   * predictor branches and return before anything is coded. */
+  int rank_only;
+  uint64_t uni_last;           /* w1_le_uniform_stream's pre-emit estimate */
+  uint64_t uni_cap;            /* estimate above which it emits nothing */
+  uint64_t pal_cap;            /* same for w1_le_palette_stream */
   /* Subtract-green duel (w1_vp8l_encode_full): sg_force 0/1 pins the
    * branch off/on and skips the loser's trial entirely; -1 keeps the
    * estimator gate. sg_used reports the branch the run took, or -1 when
@@ -4566,10 +5041,13 @@ typedef struct {
    * a candidate existed and the estimate turned it down, so the caller
    * knows a pinned re-encode could come out different. */
   int pal_force, pal_seen;
+  w1_le_pmemo_t *pm;           /* level-9 predict memo, or NULL */
+  w1_le_smemo_t *sm;           /* level-9 final-stream memo, or NULL */
   uint8_t *lens; int *codes;   /* same layout, bytes vs ints */
   int *seq;                    /* 2 * 2328 (tree emit) */
   int *htmp;                   /* 5 * 2328 (huffman build) */
   int *phist;                  /* 14 * 1024 (pixel-major predict) */
+  int64_t *pcost;              /* 512 * 14: one tile row's mode costs */
   uint32_t *cache;             /* 2048 */
   int *gcounts;                /* W1_LE_MAXG * W1_LE_NC (parse counts) */
   int *grcounts;               /* W1_LE_MAXG * W1_LE_NC (support base) */
@@ -4589,6 +5067,10 @@ typedef struct {
   const uint32_t *sv_src;
   uint64_t sv_sum;
   int sv_w, sv_h, sv_sb, sv_level, sv_cb, sv_ok;
+  /* Raw-image estimate the next w1_le_branch may take instead of computing
+   * it (its counts already in counts2); (uint64_t)-1 = none. Consumed by
+   * that call. */
+  uint64_t co_hint;
 } w1_le_ctx_t;
 
 /* Cheap content checksum for the saved-tiling guard above. */
@@ -4736,15 +5218,53 @@ static W1_UNUSED int w1_lz_matchlen(const uint32_t *a, const uint32_t *b,
   int len = 0;
   if (best >= max || a[best] != b[best]) return 0;
 #ifdef W1_USE_SSE2
-  while (len + 4 <= max) {
-    __m128i va = _mm_loadu_si128((const __m128i *)(const void *)(a + len));
-    __m128i vb = _mm_loadu_si128((const __m128i *)(const void *)(b + len));
-    if (_mm_movemask_epi8(_mm_cmpeq_epi32(va, vb)) != 65535) break;
+  /* 8 pixels per step; the first differing pixel is the lowest clear lane
+   * of the compare mask. */
+  while (len + 8 <= max) {
+    __m128i e0 = _mm_cmpeq_epi32(
+        _mm_loadu_si128((const __m128i *)(const void *)(a + len)),
+        _mm_loadu_si128((const __m128i *)(const void *)(b + len)));
+    __m128i e1 = _mm_cmpeq_epi32(
+        _mm_loadu_si128((const __m128i *)(const void *)(a + len + 4)),
+        _mm_loadu_si128((const __m128i *)(const void *)(b + len + 4)));
+    unsigned m = (unsigned)_mm_movemask_epi8(e0) |
+                 ((unsigned)_mm_movemask_epi8(e1) << 16);
+    if (m != 0xffffffffu) return len + (w1_ctz32(~m) >> 2);
+    len += 8;
+  }
+  if (len + 4 <= max) {
+    unsigned m = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi32(
+        _mm_loadu_si128((const __m128i *)(const void *)(a + len)),
+        _mm_loadu_si128((const __m128i *)(const void *)(b + len))));
+    if (m != 0xffffu) return len + (w1_ctz32(~m) >> 2);
     len += 4;
   }
 #endif
   while (len < max && a[len] == b[len]) len++;
   return len;
+}
+
+/* Sixteen-row probe after a base's candidate walk. A two-colour frame
+ * packed eight pixels per index (checker8) hashes every other position
+ * into one bucket, so its row-period match sits ~1K hops down the chain,
+ * past every depth below level 7 (levels 7+ walk far enough and skip it).
+ * Adopted only when it runs to the length cap: a shorter far match can
+ * displace a cheaper plane-coded one and grow the stream (edges L3/L6).
+ * One probe per searched base, outside the walk so the walk's code is
+ * unchanged (checker8 1024 L0-6 156/160 -> 150 B,
+ * gray_ramp L0 894 -> 836). */
+static W1_UNUSED void w1_lz_rowprobe(const uint32_t *ps, int base, int w,
+                                     int min_pos, int max_len, int *blen,
+                                     int *bdist, uint32_t *near) {
+  int d = 16 * w, l;
+  if (*blen >= max_len || d > base || base - d < min_pos) return;
+  if (ps[*blen - d] != ps[*blen] || ps[max_len - 1 - d] != ps[max_len - 1])
+    return;
+  l = w1_lz_matchlen(ps - d, ps, *blen, max_len);
+  if (l >= max_len) {
+    if (near && *blen >= 2) *near = W1_LZ_TAB(*blen, *bdist);
+    *blen = l; *bdist = d;
+  }
 }
 
 /* Longest match at every position, filled once per pixel array: the search
@@ -4994,6 +5514,11 @@ static W1_UNUSED void w1_lz_fill(uint32_t *tab, uint32_t *near,
       w1_lz_search_link(pix, chain, n, w, iters, base, &best_len, &best_dist,
                         near ? &nr : NULL, NULL);
     }
+    if (iters < 1024)
+      w1_lz_rowprobe(pix + base, base, w,
+                     base > W1_LE_MAX_DIST ? base - W1_LE_MAX_DIST : 0,
+                     n - base > W1_LE_MAX_LEN ? W1_LE_MAX_LEN : n - base,
+                     &best_len, &best_dist, near ? &nr : NULL);
     /* Store, then slide left while the two intervals keep matching. */
     max_base = base;
     tab[base] = best_dist ? W1_LZ_TAB(best_len, best_dist) : 0;
@@ -5041,28 +5566,49 @@ static W1_UNUSED void w1_lz_prepare(w1_lez_t *lz) {
   w1_le_ctx_t *ctx = lz->ctx;
   uint64_t hsh = w1_lz_pixhash(lz->pix, lz->n);
   int s;
+  if (ctx->tab_s && lz->n <= W1_LZ_SMALL_N &&
+      (int64_t)lz->n * 16 <= (int64_t)ctx->max_n) {
+    uint32_t *nr = ctx->near[0] ? ctx->near_s : NULL;
+    if (!(ctx->tab_s_valid && ctx->tab_s_n == lz->n &&
+          ctx->tab_s_w == lz->w && ctx->tab_s_iters == lz->depth &&
+          ctx->tab_s_hash == hsh)) {
+      ctx->tab_s_valid = 1; ctx->tab_s_n = lz->n; ctx->tab_s_w = lz->w;
+      ctx->tab_s_iters = lz->depth; ctx->tab_s_hash = hsh;
+      w1_lz_fill(ctx->tab_s, nr, lz->pix, lz->n, lz->w, lz->depth,
+                 &ctx->cand);
+    }
+    lz->tab = ctx->tab_s;
+    lz->near = nr;
+    return;
+  }
   for (s = 0; s < 2; s++)
     if (ctx->tab_valid[s] && ctx->tab_n[s] == lz->n &&
         ctx->tab_w[s] == lz->w && ctx->tab_iters[s] == lz->depth &&
         ctx->tab_hash[s] == hsh)
       break;
-  if (s < 2) {
-    if (ctx->tab_uses[s] < 0x40000000u) ctx->tab_uses[s]++;
-  } else {
+  ctx->tab_clock++;
+  if (s < 2) ctx->tab_hit[s] = 1;
+  else {
     if (!ctx->tab_valid[0]) s = 0;
     else if (!ctx->tab_valid[1]) s = 1;
     else {
-      uint64_t w0 = (uint64_t)ctx->tab_uses[0] * (uint64_t)ctx->tab_n[0];
-      uint64_t w1 = (uint64_t)ctx->tab_uses[1] * (uint64_t)ctx->tab_n[1];
-      s = w0 == w1 ? ctx->tab_lru : (w0 < w1 ? 0 : 1);
+      int d0 = !ctx->tab_hit[0] &&
+               ctx->tab_clock - ctx->tab_last[0] >= W1_LZ_TAB_STALE;
+      int d1 = !ctx->tab_hit[1] &&
+               ctx->tab_clock - ctx->tab_last[1] >= W1_LZ_TAB_STALE;
+      if (d0 != d1) s = d0 ? 0 : 1;
+      else if (ctx->tab_n[0] != ctx->tab_n[1])
+        s = ctx->tab_n[0] < ctx->tab_n[1] ? 0 : 1;
+      else s = ctx->tab_lru;
     }
     ctx->tab_valid[s] = 1; ctx->tab_n[s] = lz->n; ctx->tab_w[s] = lz->w;
     ctx->tab_iters[s] = lz->depth; ctx->tab_hash[s] = hsh;
-    ctx->tab_uses[s] = 0;
+    ctx->tab_hit[s] = 0;
     w1_lz_fill(ctx->tab[s], ctx->near[s], lz->pix, lz->n, lz->w, lz->depth,
                &ctx->cand);
   }
   ctx->tab_lru = 1 - s;
+  ctx->tab_last[s] = ctx->tab_clock;
   lz->tab = ctx->tab[s];
   lz->near = ctx->near[s];
 }
@@ -5186,7 +5732,19 @@ static W1_UNUSED void w1_lz_emit_match(w1_lez_t *lz, int pos, int len,
   } else {
     lz->cg[256 + lc]++; lz->cd[dc]++;
   }
-  for (k = 0; k < len; k++) w1_lz_cache_insert(lz, lz->pix[pos + k]);
+  if (lz->cache) {
+    /* Hoisted locals (the stores may alias lz); a pixel equal to the one
+     * before it rewrites the slot it just wrote, so it is skipped. */
+    uint32_t *cache = lz->cache;
+    const uint32_t *p = lz->pix + pos;
+    int sh = 32 - lz->cache_bits;
+    uint32_t last = p[0];
+    cache[(0x1e35a7bdu * last) >> sh] = last;
+    for (k = 1; k < len; k++) {
+      uint32_t px = p[k];
+      if (px != last) { cache[(0x1e35a7bdu * px) >> sh] = px; last = px; }
+    }
+  }
 }
 
 /* One tokenize run: counts (bw == NULL) or emits. lazy = lazy matching. */
@@ -5542,9 +6100,14 @@ static W1_UNUSED void w1_le_zero_counts(w1_le_ctx_t *ctx) {
 static W1_UNUSED void w1_le_scan_present(const uint32_t *pix, int n,
                                          uint8_t *present) {
   int i;
+  uint32_t last;
   for (i = 0; i < 1024; i++) present[i] = 0;
+  if (n <= 0) return;
+  last = ~pix[0];
   for (i = 0; i < n; i++) {
     uint32_t px = pix[i];
+    if (px == last) continue;   /* a repeat marks nothing new */
+    last = px;
     present[(px >> 8) & 0xff] = 1;
     present[256 + ((px >> 16) & 0xff)] = 1;
     present[512 + (px & 0xff)] = 1;
@@ -5736,6 +6299,31 @@ static W1_UNUSED uint64_t w1_le_est2(w1_le_ctx_t *ctx, const uint32_t *pix,
  * memo slot the final parse is recorded and the emit replays it; a slot
  * that already holds this stream's parse (a sizing trial re-encoded for
  * real) skips straight to the emit under the recorded tables. */
+/* Payload bits of counts under lens: a one-symbol alphabet codes in 0
+ * bits (the emit's simple-code form), extra bits ride with the length and
+ * distance symbols. */
+static W1_UNUSED uint64_t w1_le_payload_bits(const int *counts,
+                                             const uint8_t *lens, int ga) {
+  static const int offs[5] = {0, W1_LE_OFF_R, W1_LE_OFF_B, W1_LE_OFF_A,
+                              W1_LE_OFF_D};
+  int sizes[5], c, i;
+  uint64_t t = 0;
+  sizes[0] = ga; sizes[1] = sizes[2] = sizes[3] = 256; sizes[4] = 40;
+  for (c = 0; c < 5; c++) {
+    int nz = 0;
+    for (i = 0; i < sizes[c]; i++) nz += lens[offs[c] + i] != 0;
+    if (nz > 1)
+      for (i = 0; i < sizes[c]; i++)
+        t += (uint64_t)(unsigned)counts[offs[c] + i] * lens[offs[c] + i];
+  }
+  for (i = 4; i < 24; i++)
+    t += (uint64_t)(unsigned)counts[256 + i] * (uint64_t)((i - 2) >> 1);
+  for (i = 4; i < 40; i++)
+    t += (uint64_t)(unsigned)counts[W1_LE_OFF_D + i] *
+         (uint64_t)((i - 2) >> 1);
+  return t;
+}
+
 static W1_UNUSED void w1_le_finish(w1_le_ctx_t *ctx, const uint32_t *pix,
                                    int w, int h, int level, int depth,
                                    int cache_bits, const uint8_t *flat,
@@ -5755,8 +6343,8 @@ static W1_UNUSED void w1_le_finish(w1_le_ctx_t *ctx, const uint32_t *pix,
   lz.cd = ctx->counts + W1_LE_OFF_D;
   /* Optimal parse for every table-driven pass (pass B, support replays and
    * the final emit all re-derive the same DP from the same lens). opt_cap is
-   * non-zero when the public level allows it (W1_LZ_OPT_LEVEL) and the image
-   * is within W1_LZ_OPT_MAXN; every other call stays greedy. */
+   * non-zero only in the run w1_vp8l_encode_full spends the DP on (level
+   * W1_LZ_OPT_LEVEL, any size); every other call stays greedy. */
   lz.opt = (level >= 1 && ctx->dp && n <= ctx->opt_cap);
   lz.dp = ctx->dp; lz.back = ctx->back;
   replay = w1_le_tk_match(tk, W1_TK_FINISH, pix, w, h, level, cache_bits,
@@ -5769,9 +6357,25 @@ static W1_UNUSED void w1_le_finish(w1_le_ctx_t *ctx, const uint32_t *pix,
     lz.ld = ctx->lens + W1_LE_OFF_D;
   } else {
     int recorded = 0;
+    /* Level 0 keeps pass A's flat-cost parse unless the table-driven one
+     * below comes out smaller (payload plus tables): pass B takes mixed
+     * 1024 92.6 -> 87.4 KB at twice the depth, alpha 486 -> 452 B, but grows
+     * alpha_sweep 1384 -> 1438 B. */
+    const int *fc = ctx->counts3;
+    uint64_t flat_bits = 0;
+    uint8_t flat_lens[W1_LE_NC];
+    int flat_counts[W1_LE_NC];
     w1_le_force_present(ctx, present);
     w1_le_build_tables(ctx, cache_size);
-    if (level >= 1) {
+    if (level == 0) {
+      uint8_t tb0[8192];
+      flat_bits = w1_le_payload_bits(ctx->counts, ctx->lens, ga) +
+                  w1_le_tablebits(ctx, ga, tb0, sizeof tb0);
+      memcpy(flat_lens, ctx->lens, (size_t)W1_LE_NC);
+      memcpy(flat_counts, ctx->counts, sizeof flat_counts);
+      lz.depth = 2 * depth;
+    }
+    {
       /* Pass B under H1 -> emitted counts. */
       lz.lg = ctx->lens; lz.lr = ctx->lens + W1_LE_OFF_R;
       lz.lb = ctx->lens + W1_LE_OFF_B; lz.la = ctx->lens + W1_LE_OFF_A;
@@ -5812,12 +6416,82 @@ static W1_UNUSED void w1_le_finish(w1_le_ctx_t *ctx, const uint32_t *pix,
               ctx->counts[k2] = ctx->counts3[k2];
           w1_le_build_tables(ctx, cache_size);
         }
+        /* A distance symbol the parse used a handful of times still costs
+         * every other copy a bit once the alphabet holds two symbols
+         * (alpha 1024: one dist-765 copy on row 1 next to 260 plane-code
+         * copies, 529 distance bits where 258 do). The table-driven parse
+         * cannot see that, so the rarer one is forbidden in one more
+         * parse, kept when payload plus tables come out smaller. Only a
+         * two-symbol alphabet can go free (0 bits per copy); with more,
+         * dropping one rare symbol saved a few bytes at best and the extra
+         * parses cost 5% on photos. */
+        if (recorded || !tk) {
+          const int *cd3 = ctx->counts3 + W1_LE_OFF_D;
+          int used = 0, rare = -1, tot = 0;
+          for (k2 = 0; k2 < 40; k2++)
+            if (cd3[k2]) {
+              used++; tot += cd3[k2];
+              if (rare < 0 || cd3[k2] < cd3[rare]) rare = k2;
+            }
+          if (used == 2 && cd3[rare] * 16 <= tot) {
+            uint8_t sv_lens[W1_LE_NC], tb[8192];
+            int sv_counts[W1_LE_NC], sv_soft = lz.soft;
+            uint64_t cur, trial;
+            memcpy(sv_lens, ctx->lens, (size_t)W1_LE_NC);
+            memcpy(sv_counts, ctx->counts, sizeof sv_counts);
+            cur = w1_le_payload_bits(ctx->counts3, ctx->lens, ga) +
+                  w1_le_tablebits(ctx, ga, tb, sizeof tb);
+            ctx->lens[W1_LE_OFF_D + rare] = 0;
+            for (k2 = 0; k2 < W1_LE_NC; k2++) ctx->counts[k2] = 0;
+            lz.cg = ctx->counts; lz.cr = ctx->counts + W1_LE_OFF_R;
+            lz.cb = ctx->counts + W1_LE_OFF_B;
+            lz.ca = ctx->counts + W1_LE_OFF_A;
+            lz.cd = ctx->counts + W1_LE_OFF_D;
+            lz.tk_out = tk ? tk->tok : NULL;
+            lz.soft = 0;
+            w1_lz_run(&lz, 1);
+            lz.tk_out = NULL;
+            missing = 0;
+            for (k2 = 0; k2 < W1_LE_NC; k2++)
+              if (ctx->counts[k2] > 0 && ctx->lens[k2] == 0) missing = 1;
+            trial = UINT64_MAX;
+            if (!missing) {
+              w1_le_build_tables(ctx, cache_size);
+              trial = w1_le_payload_bits(ctx->counts, ctx->lens, ga) +
+                      w1_le_tablebits(ctx, ga, tb, sizeof tb);
+            }
+            if (trial < cur) fc = ctx->counts;
+            if (trial >= cur) {
+              /* Rejected: the recorded tokens are the trial's, so the
+               * kept parse is re-run to record it again. */
+              memcpy(ctx->lens, sv_lens, (size_t)W1_LE_NC);
+              w1_le_build_codes(ctx, cache_size);
+              for (k2 = 0; k2 < W1_LE_NC; k2++) ctx->counts[k2] = 0;
+              lz.tk_out = tk ? tk->tok : NULL;
+              lz.soft = sv_soft;
+              w1_lz_run(&lz, 1);
+              lz.tk_out = NULL;
+              memcpy(ctx->counts, sv_counts, sizeof sv_counts);
+            }
+          }
+        }
         lz.cg = NULL; lz.cr = NULL; lz.cb = NULL; lz.ca = NULL; lz.cd = NULL;
       }
-    } else {
-      /* L0: keep flat costs for the emit run (reproduces pass A). */
-      lz.lg = flat; lz.lr = flat + W1_LE_OFF_R; lz.lb = flat + W1_LE_OFF_B;
-      lz.la = flat + W1_LE_OFF_A; lz.ld = flat + W1_LE_OFF_D;
+      if (level == 0) {
+        uint8_t tb0[8192];
+        if (w1_le_payload_bits(fc, ctx->lens, ga) +
+                w1_le_tablebits(ctx, ga, tb0, sizeof tb0) >= flat_bits) {
+          /* Flat parse kept: its tables, and flat costs for the emit run
+           * (reproduces pass A). */
+          memcpy(ctx->lens, flat_lens, (size_t)W1_LE_NC);
+          memcpy(ctx->counts, flat_counts, sizeof flat_counts);
+          w1_le_build_codes(ctx, cache_size);
+          lz.lg = flat; lz.lr = flat + W1_LE_OFF_R; lz.lb = flat + W1_LE_OFF_B;
+          lz.la = flat + W1_LE_OFF_A; lz.ld = flat + W1_LE_OFF_D;
+          recorded = 0;
+          lz.depth = depth;
+        }
+      }
     }
     if (tk) {
       if (recorded)
@@ -5853,6 +6527,33 @@ static W1_UNUSED void w1_le_finish(w1_le_ctx_t *ctx, const uint32_t *pix,
   w1_lz_run(&lz, level >= 1);
 }
 
+static W1_UNUSED int w1_le_uniform(const uint32_t *pix, int n);
+
+/* Tables-only emit for an image whose pixels are all equal: each channel
+ * alphabet holds one symbol, so the codes are single-symbol (0 bits per
+ * pixel) and only the five table headers cost anything. The LZ path instead
+ * pays for one literal plus one copy, which needs a length symbol in the
+ * green alphabet and forces that table off the compact simple-code form -
+ * 34-50 wasted bits on a predictor map whose tiles all chose one mode. No
+ * header bits are written: the caller already emitted the color-cache bit
+ * (and the meta bit on the main stream), exactly as for the token path. */
+static W1_UNUSED void w1_le_uniform_tokens(w1_le_ctx_t *ctx,
+                                           const uint32_t *pix, int n,
+                                           int cache_bits, w1_bw_t *bw) {
+  static const int offsets[4] = {0, W1_LE_OFF_R, W1_LE_OFF_B, W1_LE_OFF_A};
+  static const int shifts[4] = {8, 16, 0, 24};
+  int cache_size = cache_bits ? (1 << cache_bits) : 0, c;
+  uint32_t p = pix[0];
+  w1_le_zero_counts(ctx);
+  for (c = 0; c < 4; c++)
+    ctx->counts[offsets[c] + ((p >> shifts[c]) & 255)] = n;
+  w1_le_build_tables(ctx, cache_size);
+  for (c = 0; c < 4; c++)
+    w1_huff_emit(bw, ctx->lens + offsets[c],
+                 c ? 256 : 280 + cache_size, ctx->seq);
+  w1_huff_emit(bw, ctx->lens + W1_LE_OFF_D, 40, ctx->seq);
+}
+
 /* Encode tables + tokens for one image stream (sub-images: fresh pass A).
  * The cache bit is written by the caller. tk: optional memo slot (see
  * w1_le_finish); a slot holding this stream's parse skips pass A too. */
@@ -5863,6 +6564,10 @@ static W1_UNUSED void w1_le_encode_tokens(w1_le_ctx_t *ctx,
                                           w1_le_tk_t *tk) {
   uint8_t present[1024];
   int depth = (int)w1_le_depths[level];
+  if (w1_le_uniform(pix, w * h)) {
+    w1_le_uniform_tokens(ctx, pix, w * h, cache_bits, bw);
+    return;
+  }
   if (!w1_le_tk_match(tk, W1_TK_FINISH, pix, w, h, level, cache_bits,
                       depth)) {
     w1_le_scan_present(pix, w * h, present);
@@ -5871,8 +6576,6 @@ static W1_UNUSED void w1_le_encode_tokens(w1_le_ctx_t *ctx,
   w1_le_finish(ctx, pix, w, h, level, depth, cache_bits, flat, present, bw,
                tk);
 }
-
-static W1_UNUSED int w1_le_uniform(const uint32_t *pix, int n);
 
 static W1_UNUSED int w1_le_literal_group(int x, int y, int w, int h, int side) {
   if (side == 0) return y < 4;
@@ -5981,6 +6684,8 @@ static W1_UNUSED int w1_le_sub_green_m(uint32_t *img, int n, int *htmp,
   int *hr2 = htmp + 768, *hb2 = htmp + 1024;
   int i;
   uint64_t before, after;
+  /* A forced subtract (keep16 < 0) reads no histogram. */
+  if (keep16 >= 0) {
   for (i = 0; i < 256; i++) hr[i] = hg[i] = hb[i] = hr2[i] = hb2[i] = 0;
   for (i = 0; i < n; i++) {
     int g = (int)((img[i] >> 8) & 0xff);
@@ -5997,8 +6702,9 @@ static W1_UNUSED int w1_le_sub_green_m(uint32_t *img, int n, int *htmp,
    * can still code several times larger than raw. keep16 is the fraction of
    * the "before" cost the "after" must beat (16 = any win, 12 = 25%); a
    * negative keep16 subtracts unconditionally (green-duel forced branch). */
-  if (keep16 >= 0 && (uint64_t)after * 16 >= (uint64_t)before * keep16)
+  if ((uint64_t)after * 16 >= (uint64_t)before * keep16)
     return 0;
+  }
   for (i = 0; i < n; i++) {
     int g = (int)((img[i] >> 8) & 0xff);
     int r = (int)(((img[i] >> 16) & 0xff) - g) & 0xff;
@@ -6515,6 +7221,99 @@ static W1_UNUSED void w1_le_group_stream_legacy(w1_le_ctx_t *ctx,
   w1_lz_run(&lz, 1);
 }
 
+/* Two-group stream over a recorded cache-free parse: tiles where a literal
+ * token starts form group 0, the rest (copies only) group 1, and the same
+ * tokens are replayed under per-group tables. The pixel-histogram group
+ * streams cannot find this split when every tile holds the same colours
+ * (palette16 1024: 2048 literals in the top rows, 128 row copies below;
+ * one table set prices each copy's length at 14 bits among 256 literal
+ * symbols, the copy group's lone length symbol at its extra bits). Returns
+ * 0, writing nothing, when every tile or none holds a literal. */
+static W1_UNUSED int w1_le_token_group_stream(w1_le_ctx_t *ctx,
+    const uint32_t *pix, int w, int h, const uint8_t *flat, w1_bw_t *bw,
+    const w1_le_tk_t *src) {
+  /* The tile map (at most W1_LE_GRP_MAXTILES words) lives in the
+   * predictor-histogram scratch, idle while a stream is coded; callers of
+   * w1_le_stream may pass no meta buffer. */
+  uint32_t *map = (uint32_t *)ctx->phist;
+  static const int offsets[5] = {0, W1_LE_OFF_R, W1_LE_OFF_B, W1_LE_OFF_A, W1_LE_OFF_D};
+  static const int sizes[5] = {280, 256, 256, 256, 40};
+  int pb = 5, tw, th, nt, i, pos, lit = 0, g, c, j;
+  uint64_t payload_bits;
+  w1_lez_t lz;
+  for (;;) {
+    tw = (w + (1 << pb) - 1) >> pb;
+    th = (h + (1 << pb) - 1) >> pb;
+    nt = tw * th;
+    if (nt <= W1_LE_GRP_MAXTILES || pb >= 9) break;
+    pb++;
+  }
+  for (i = 0; i < nt; i++) map[i] = 1u << 8;
+  for (i = 0, pos = 0; i < src->ntok; i++) {
+    uint32_t bk = src->tok[i];
+    if (W1_LZ_BK_ISMATCH(bk)) {
+      pos += (int)(bk & 0xfffu) + 2;
+    } else {
+      uint32_t *t = map + ((pos / w) >> pb) * tw + ((pos % w) >> pb);
+      lit += *t != 0;
+      *t = 0;
+      pos++;
+    }
+  }
+  if (lit == 0 || lit == nt) return 0;
+  w1_bw_put(bw, 0, 1);              /* no color cache */
+  w1_bw_put(bw, 1, 1);              /* meta (entropy) image */
+  w1_bw_put(bw, (uint32_t)(pb - 2), 3);
+  w1_bw_put(bw, 0, 1);
+  w1_le_encode_tokens(ctx, map, tw, th, 1, 0, flat, bw, NULL);
+  memset(&lz, 0, sizeof(lz));
+  lz.pix = pix; lz.w = w; lz.n = w * h;
+  lz.ctx = ctx;
+  lz.ngroups = 2; lz.group_shift = pb; lz.group_width = tw;
+  lz.group_map = map;
+  /* Distances take the plane or direct form the finish parse chose. */
+  lz.ld = src->lens + W1_LE_OFF_D;
+  lz.tk_in = src->tok; lz.tk_in_n = src->ntok;
+  for (g = 0; g < 2; g++) lz.group_counts[g] = ctx->gcounts + g * W1_LE_NC;
+  memset(ctx->gcounts, 0, (size_t)2 * W1_LE_NC * sizeof(int));
+  w1_lz_run(&lz, 1);
+  w1_le_grp_build(ctx, ctx->gcounts, 2);
+  for (g = 0; g < 2; g++) {
+    const uint8_t *lens = ctx->glens + g * W1_LE_NC;
+    for (c = 0; c < 5; c++) {
+      int nz = 0;
+      for (j = 0; j < sizes[c]; j++) nz += lens[offsets[c] + j] != 0;
+      lz.group_single[g][c] = nz <= 1;
+    }
+  }
+  if (!bw->p) {
+    payload_bits = w1_le_grp_payload(ctx, 2);
+    for (g = 0; g < 2; g++)
+      for (c = 0; c < 5; c++)
+        w1_huff_emit(bw, ctx->glens + g * W1_LE_NC + offsets[c], sizes[c],
+                     ctx->seq);
+    payload_bits += (unsigned)bw->nbits;
+    bw->bytes += (size_t)(payload_bits >> 3);
+    bw->nbits = (int)(payload_bits & 7);
+    return 1;
+  }
+  for (g = 0; g < 2; g++) {
+    const uint8_t *lens = ctx->glens + g * W1_LE_NC;
+    int *codes = ctx->gcodes + g * W1_LE_NC;
+    w1_huff_codes(lens, 280, codes);
+    w1_huff_codes(lens + W1_LE_OFF_R, 256, codes + W1_LE_OFF_R);
+    w1_huff_codes(lens + W1_LE_OFF_B, 256, codes + W1_LE_OFF_B);
+    w1_huff_codes(lens + W1_LE_OFF_A, 256, codes + W1_LE_OFF_A);
+    w1_huff_codes(lens + W1_LE_OFF_D, 40, codes + W1_LE_OFF_D);
+    lz.group_lens[g] = lens;
+    lz.group_codes[g] = codes;
+    for (c = 0; c < 5; c++)
+      w1_huff_emit(bw, lens + offsets[c], sizes[c], ctx->seq);
+  }
+  lz.bw = bw;
+  w1_lz_run(&lz, 1);
+  return 1;
+}
 
 static W1_UNUSED void w1_le_stream(w1_le_ctx_t *ctx, const uint32_t *pix,
                                     int w, int h, int level, int depth,
@@ -6522,21 +7321,50 @@ static W1_UNUSED void w1_le_stream(w1_le_ctx_t *ctx, const uint32_t *pix,
                                     const uint8_t *flat, const uint8_t *present,
                                     uint32_t *meta, w1_bw_t *bw) {
   w1_bw_t start = *bw, trial;
-  uint64_t best;
+  uint64_t best, fin_bits, noc_bits = 0;
   int choice = -2, side;
   /* Two memo slots: `pinned` holds the current best trial's parse (the
    * final encode replays it), the other is free for the next trial. Both
    * are scoped to this call (see w1_le_tk_t). */
   w1_le_tk_t *pinned = NULL, *tk;
+  w1_le_smemo_t *sm = ctx->opt_cap ? ctx->sm : NULL;
+  uint64_t skey = 0;
+  if (sm) {
+    int i;
+    uint64_t pk = 1469598103934665603ULL;
+    if (present)
+      for (i = 0; i < 1024; i++) { pk ^= present[i]; pk *= 1099511628211ULL; }
+    skey = w1_le_sum(pix, w * h) * 3 +
+           w1_le_sum((const uint32_t *)ctx->counts, W1_LE_NC) * 5 + pk;
+    for (i = 0; i < sm->n; i++)
+      if (sm->s[i].key == skey && sm->s[i].w == w && sm->s[i].h == h &&
+          sm->s[i].level == level && sm->s[i].depth == depth &&
+          sm->s[i].cache_bits == cache_bits) {
+        const uint8_t *q = sm->s[i].bits;
+        uint64_t k, nb = sm->s[i].nbits;
+        for (k = 0; k + 16 <= nb; k += 16)
+          w1_bw_put(bw, (uint32_t)q[k >> 3] | (uint32_t)q[(k >> 3) + 1] << 8,
+                    16);
+        if (k < nb)
+          w1_bw_put(bw, (uint32_t)q[k >> 3] | (uint32_t)q[(k >> 3) + 1] << 8,
+                    (int)(nb - k));
+        memcpy(ctx->counts, sm->s[i].counts, W1_LE_NC * sizeof(int));
+        memcpy(ctx->lens, sm->s[i].lens, W1_LE_NC);
+        memcpy(ctx->codes, sm->s[i].codes, W1_LE_NC * sizeof(int));
+        ctx->tk[0].valid = 0; ctx->tk[1].valid = 0;
+        return;
+      }
+  }
   ctx->tk[0].valid = 0; ctx->tk[1].valid = 0;
   w1_bw_put(bw, cache_bits != 0, 1);
   if (cache_bits) w1_bw_put(bw, (uint32_t)cache_bits, 4);
   w1_bw_put(bw, 0, 1);
-  if (level < 6 && w1_le_uniform(pix, w * h)) {
-    /* Below level 6 the single adapted stream is final, except for a
-     * one-colour image: all four channel codes are single-symbol, so the
+  if (w1_le_uniform(pix, w * h)) {
+    /* A one-colour image: all four channel codes are single-symbol, so the
      * literal stream costs 0 bits per pixel and beats any token stream
-     * (512x512: 126 -> 32 B) without running the LZ passes at all. */
+     * (512x512: 126 -> 32 B) without running the LZ passes at all; level
+     * 6+ used to reach the same stream after the finish and group trials
+     * (flat 1024 L6: 4 of 24 Mcycles). */
     *bw = start;
     w1_le_literal_stream(ctx, pix, w, h, flat, meta, -1, bw);
     ctx->tk[0].valid = 0;
@@ -6545,6 +7373,7 @@ static W1_UNUSED void w1_le_stream(w1_le_ctx_t *ctx, const uint32_t *pix,
   w1_le_finish(ctx, pix, w, h, level, depth, cache_bits, flat, present, bw,
                &ctx->tk[0]);
   best = bw->err ? UINT64_MAX : w1_bw_bit_size(bw) - w1_bw_bit_size(&start);
+  fin_bits = best;
   if (cache_bits) {
     uint8_t *park = w1_bw_trial(&start, bw, &trial);
     uint64_t cost;
@@ -6552,6 +7381,7 @@ static W1_UNUSED void w1_le_stream(w1_le_ctx_t *ctx, const uint32_t *pix,
     w1_bw_put(&trial, 0, 2);
     w1_le_encode_tokens(ctx, pix, w, h, level, 0, flat, &trial, tk);
     cost = w1_bw_bit_size(&trial) - w1_bw_bit_size(&start);
+    noc_bits = trial.err ? 0 : cost;
     if (!trial.err && cost < best) {
       best = cost; choice = -1; pinned = tk;
       if (park) { w1_bw_adopt(&start, bw, &trial, park); choice = -2; }
@@ -6567,7 +7397,48 @@ static W1_UNUSED void w1_le_stream(w1_le_ctx_t *ctx, const uint32_t *pix,
       best = cost; choice = side + 1;
     }
   }
-  if (level >= 6 && w * h >= 1024 && best >= 1024) {
+  /* The two group streams code without the colour cache. Over the grid,
+   * the real corpus and its 3-16 colour quantizations (levels 6-8, 612
+   * stream calls) a group stream came in at most 6.7% under the cache-free
+   * stream, and every group win had that stream within 0.8% of the cached
+   * one; where the cache saves more than 1/9 of the cache-free stream
+   * (noc > 9/8 fin) a group stream would need an 11% gain to win, so both
+   * encodes are skipped (palette16 512 L6: 20 of ~100 Mcycles). */
+  /* The token-group trial reads the cache-free parse still in slot 0 (the
+   * finish's without a cache, else the no-cache trial's), so it runs before
+   * the group streams reuse that slot. It walks the tokens and stops when
+   * every tile holds a literal, so it runs at every level: the palette
+   * index stream is coded at level 5 whatever the effort. Like the
+   * clustered stream it needs a payload to pay for a second set of tables:
+   * below 1/64 bit per pixel it is skipped (stripes_v 1024 L4: 3.5 ms of
+   * replays that never win). */
+  if (w * h >= 1024 && best >= 1024 &&
+      best * 64 >= (uint64_t)w * (uint64_t)h &&
+      !(noc_bits && fin_bits != UINT64_MAX && noc_bits * 8 > fin_bits * 9) &&
+      ctx->tk[0].valid && ctx->tk[0].kind == W1_TK_FINISH &&
+      ctx->tk[0].pix == pix && ctx->tk[0].w == w && ctx->tk[0].h == h &&
+      ctx->tk[0].cache_bits == 0) {
+    uint8_t *park = w1_bw_trial(&start, bw, &trial);
+    if (w1_le_token_group_stream(ctx, pix, w, h, flat, &trial,
+                                 &ctx->tk[0])) {
+      uint64_t cost = w1_bw_bit_size(&trial) - w1_bw_bit_size(&start);
+      if (!trial.err && cost < best) {
+        best = cost; choice = 7; pinned = &ctx->tk[0];
+        if (park) { w1_bw_adopt(&start, bw, &trial, park); choice = -2; }
+      }
+    }
+  }
+  /* Both group streams pay a group map and a second (up to eighth) set of
+   * tables, so they need a payload to win back: over the grid (64-1024),
+   * the real corpus and its quantizations (levels 6-8, 664 legacy trials)
+   * the legacy stream won below 1/64 bit per pixel only on gray_ramp 1024
+   * (3 bits, the same bytes), and the clustered one never beat the stream
+   * in hand below 1/44 (1.3-1.5x at 1/64 or less). Below 1/64 both are
+   * skipped (stripes_v 1024 L6: 2 x 26 Mcycles of legacy trial and final
+   * encode; photo 1024 L6 190 -> 167 ms). */
+  if (level >= 6 && w * h >= 1024 && best >= 1024 &&
+      best * 64 >= (uint64_t)w * (uint64_t)h &&
+      !(noc_bits && fin_bits != UINT64_MAX && noc_bits * 8 > fin_bits * 9)) {
     uint8_t *park;
     uint64_t cost;
     tk = pinned == &ctx->tk[0] ? &ctx->tk[1] : &ctx->tk[0];
@@ -6597,11 +7468,33 @@ static W1_UNUSED void w1_le_stream(w1_le_ctx_t *ctx, const uint32_t *pix,
                                 pinned);
     } else if (choice == 6) {
       w1_le_group_stream(ctx, pix, w, h, level, flat, meta, bw, pinned);
+    } else if (choice == 7) {
+      w1_le_token_group_stream(ctx, pix, w, h, flat, bw, pinned);
     } else {
       w1_le_literal_stream(ctx, pix, w, h, flat, meta, choice - 1, bw);
     }
   }
   ctx->tk[0].valid = 0; ctx->tk[1].valid = 0;
+  if (sm && sm->n < W1_LE_SM_SLOTS && bw->p && start.p && !bw->err &&
+      w1_bw_bit_size(bw) - w1_bw_bit_size(&start) <= (uint64_t)sm->cap * 8) {
+    uint64_t nb = w1_bw_bit_size(bw) - w1_bw_bit_size(&start), i;
+    uint64_t wrote = (uint64_t)(bw->bytes - start.bytes) * 8;
+    uint8_t *q = sm->s[sm->n].bits;
+    memset(q, 0, sm->cap + 2);
+    for (i = 0; i < nb; i++) {
+      uint64_t j = i + (unsigned)start.nbits;
+      unsigned bit = j < wrote ? (start.p[j >> 3] >> (j & 7)) & 1u
+                               : (bw->buf >> (unsigned)(j - wrote)) & 1u;
+      q[i >> 3] |= (uint8_t)(bit << (i & 7));
+    }
+    sm->s[sm->n].key = skey; sm->s[sm->n].nbits = nb;
+    sm->s[sm->n].w = w; sm->s[sm->n].h = h; sm->s[sm->n].level = level;
+    sm->s[sm->n].depth = depth; sm->s[sm->n].cache_bits = cache_bits;
+    memcpy(sm->s[sm->n].counts, ctx->counts, W1_LE_NC * sizeof(int));
+    memcpy(sm->s[sm->n].lens, ctx->lens, W1_LE_NC);
+    memcpy(sm->s[sm->n].codes, ctx->codes, W1_LE_NC * sizeof(int));
+    sm->n++;
+  }
 }
 
 /* Shannon-ish score of a 256-bin histogram (skips zeros): used by the
@@ -6710,7 +7603,36 @@ static W1_UNUSED void w1_le_uniform_residual(const uint32_t *orig,
   }
 }
 
-#define W1_LE_MAXTIES 16
+/* Pixel-major predict tiles hold >= 1024 pixels, so they are at least 32
+ * wide: a row of them spans at most 16384 / 32 tiles. */
+#define W1_LE_PC_TILES (WEBP1_MAX_DIM / 32)
+
+/* A tile's 14 mode costs read only its own pixels, the row above it and
+ * the column left of it (T, TL, TR, L), and on the right edge the first
+ * pixel of each row (the TR fallback); the image's origin row and column
+ * code differently. The tile S rows up (_up) or S columns left (_left),
+ * away from those edges, scores every mode the same when all of that
+ * matches, so its costs stand in for a full histogram pass. */
+static W1_UNUSED int w1_le_tile_same_up(const uint32_t *o, int w, int x0,
+                                        int x1, int y0, int y1, int S) {
+  int cx0 = x0 ? x0 - 1 : 0, cx1 = x1 < w ? x1 + 1 : w, r;
+  for (r = y0 - 1; r < y1; r++) {
+    const uint32_t *a = o + (size_t)r * w, *b = a - (size_t)S * w;
+    if (memcmp(a + cx0, b + cx0, (size_t)(cx1 - cx0) * 4)) return 0;
+    if (x1 == w && a[0] != b[0]) return 0;
+  }
+  return 1;
+}
+
+static W1_UNUSED int w1_le_tile_same_left(const uint32_t *o, int w, int x0,
+                                          int y0, int y1, int S) {
+  int r;
+  for (r = y0 ? y0 - 1 : 0; r < y1; r++) {
+    const uint32_t *a = o + (size_t)r * w + x0 - 1;
+    if (memcmp(a, a - S, (size_t)(S + 2) * 4)) return 0;
+  }
+  return 1;
+}
 
 static W1_UNUSED void w1_le_predict(w1_le_ctx_t *ctx, const uint32_t *orig,
                                      uint32_t *res, int w, int h, int sb,
@@ -6723,6 +7645,25 @@ static W1_UNUSED void w1_le_predict(w1_le_ctx_t *ctx, const uint32_t *orig,
    * alpha at every pixel but the origin, so the alpha residual histogram
    * is mode-independent and the pixel-major path skips its increments. */
   int alpha_uni = -1;
+  w1_le_pmemo_t *pm = ctx->pm;
+  uint64_t psum = 0;
+  int pslot = -1;
+  if (pm && tiebuf && *ntie_out == 0 && (size_t)tw * (size_t)th <= pm->cap) {
+    int i;
+    psum = w1_le_sum(orig, w * h);
+    for (i = 0; i < pm->n; i++)
+      if (pm->s[i].sum == psum && pm->s[i].w == w && pm->s[i].h == h &&
+          pm->s[i].sb == sb && pm->s[i].bonus == bonus) {
+        memcpy(modes, pm->s[i].modes, (size_t)tw * (size_t)th);
+        memcpy(tiebuf, pm->s[i].ties, (size_t)pm->s[i].nties * 2 * sizeof(int));
+        *ntie_out = pm->s[i].nties;
+        for (ty = 0; ty < th; ty++)
+          for (tx = 0; tx < tw; tx++)
+            w1_le_retile(orig, res, w, h, sb, tx, ty, modes[ty * tw + tx]);
+        return;
+      }
+    if (pm->n < W1_LE_PM_SLOTS) pslot = pm->n;
+  }
   /* Establish the touched-bins invariant (all zero): per-mode histograms
    * then track only touched bins instead of memsetting 4 KB per mode. */
   memset(hist, 0, 1024 * sizeof(int));
@@ -6748,7 +7689,20 @@ static W1_UNUSED void w1_le_predict(w1_le_ctx_t *ctx, const uint32_t *orig,
         int npx = (x1 - x0) * (y1 - y0);
         int *H = ctx->phist;
         uint16_t *H16 = (uint16_t *)ctx->phist;
-        int i;
+        int i, S = 1 << sb, same;
+        int64_t *pc = ctx->pcost + (size_t)tx * 14;
+        /* Repeated tiles (tilesets, periodic art, stripes: 7/8 of the
+         * sb 5 tiles on stripes_v and palette16 512) take the matching
+         * tile's costs: the one above still sits in this slot, the one
+         * to the left in the previous. */
+        same = ty >= 2 && y1 - y0 == S &&
+               w1_le_tile_same_up(orig, w, x0, x1, y0, y1, S);
+        if (!same && tx >= 2 && x1 < w &&
+            w1_le_tile_same_left(orig, w, x0, y0, y1, S)) {
+          memcpy(pc, pc - 14, 14 * sizeof(int64_t));
+          same = 1;
+        }
+        if (!same) {
         if (alpha_uni < 0) {
           uint32_t a0 = orig[0] >> 24;
           for (i = 1; i < w * h; i++) if ((orig[i] >> 24) != a0) break;
@@ -6826,6 +7780,11 @@ static W1_UNUSED void w1_le_predict(w1_le_ctx_t *ctx, const uint32_t *orig,
             c -= (int64_t)s;
             c += w1_le_pred_bias(hc);
           }
+          pc[m] = c;
+        }
+        }
+        for (m = 0; m < 14; m++) {
+          int64_t c = pc[m];
           if (m == left) c -= (int64_t)bonus;
           if (m == top) c -= (int64_t)bonus;
           if (c < best) { second = best; best = c; altm = bestm; bestm = m; }
@@ -6905,6 +7864,14 @@ static W1_UNUSED void w1_le_predict(w1_le_ctx_t *ctx, const uint32_t *orig,
       }
       w1_le_retile(orig, res, w, h, sb, tx, ty, bestm);
     }
+  }
+  if (pslot >= 0) {
+    pm->s[pslot].sum = psum; pm->s[pslot].w = w; pm->s[pslot].h = h;
+    pm->s[pslot].sb = sb; pm->s[pslot].bonus = bonus;
+    pm->s[pslot].nties = *ntie_out;
+    memcpy(pm->s[pslot].modes, modes, (size_t)tw * (size_t)th);
+    memcpy(pm->s[pslot].ties, tiebuf, (size_t)*ntie_out * 2 * sizeof(int));
+    pm->n++;
   }
 }
 
@@ -7049,24 +8016,6 @@ static W1_UNUSED int w1_le_pick_sb(w1_le_ctx_t *ctx, const uint32_t *src,
   return ladsb;
 }
 
-/* Exactly two distinct alpha values (e.g. a checkerboard). The uniform
- * predictor trial below is aimed at this structure: with a 2-valued alpha
- * the RGB residual is the only thing the mode choice can mis-cost, and
- * the per-tile spatial heuristic is blind to LZ structure there. Opaque
- * images (single alpha value) skip the trial entirely. */
-static W1_UNUSED int w1_le_alpha2(const uint32_t *px, int n) {
-  unsigned a0 = 0x100u, a1 = 0x100u;
-  int i;
-  for (i = 0; i < n; i++) {
-    unsigned a = (px[i] >> 24) & 0xffu;
-    if (a == a0 || a == a1) continue;
-    if (a0 == 0x100u) { a0 = a; continue; }
-    if (a1 == 0x100u) { a1 = a; continue; }
-    return 0;
-  }
-  return a0 != 0x100u && a1 != 0x100u;
-}
-
 /* One L6 branch: pred search+gate on src[0..n), color iff pred. src is
  * preserved; dst is scratch; the winner is copied to out (may equal src,
  * never dst). modes/modepix/ximg/counts are scratch+out. Returns total
@@ -7087,23 +8036,18 @@ static W1_UNUSED uint64_t w1_le_branch(w1_le_ctx_t *ctx, const uint32_t *src,
    * badly enough to pick a stream 1.5-2.5x too large. Depth 0 is reserved
    * for pick_sb's tile-size ranking, which only needs relative order. */
   int sl = level;
-  /* Uniform-mode predictor trial. The per-tile spatial heuristic scores
-   * residual entropy plus a zero bias but is blind to LZ structure, so on
+  /* Uniform-mode ranking. The per-tile spatial heuristic scores residual
+   * entropy plus a zero bias but is blind to LZ structure, so on
    * row/column-linear content it can prefer a mode whose constant residual
    * is entropy-cheap yet token-expensive (on the checker-alpha target it
-   * picks TopLeft, encoding 30 literals, where Left needs 5). Try globally
-   * uniform modes under the LZ-aware estimate and adopt one only when it
-   * beats the searched tiling by a margin. 2-valued-alpha images try the
-   * Left/Top pair; every other image tries Select then Left (Select first so
-   * estimate ties keep it). The entropy score rejects Select and Left on
-   * mixed content where the tile-wise search picks Top for 4058 B while
-   * Select codes 3080 B and Left 1060 B at 64px. */
-  int ubest = -1;
-  uint64_t ubest_est = (uint64_t)-1;
-  int is_a2 = w1_le_alpha2(src, n);
-  /* No size cap: 512/1024 cells trail lib precisely where this trial was
-   * disabled (mixed-512 28616 vs 25288, alpha-512/1024). */
-  int do_uni = level >= 9 && ctx->uni_force < 0;
+   * picks TopLeft, encoding 30 literals, where Left needs 5). Every uniform
+   * mode is ranked under the LZ-aware estimate and the level-9 portfolio
+   * re-encodes the best ones as finished streams. Nothing is adopted here
+   * on the estimate: on art_midnight adopting one flipped the green
+   * branch's predictor gate and cost 3731 -> 3829 B after the optimal
+   * parse. The ranking only feeds that portfolio, so it runs only in the
+   * portfolio's rank-only run. */
+  int do_uni = ctx->rank_only && ctx->uni_force < 0;
   /* Portfolio member: one mode everywhere, no search (the caller compares
    * the finished streams, so no estimate margin applies here). */
   if (ctx->uni_force >= 0) {
@@ -7116,17 +8060,10 @@ static W1_UNUSED uint64_t w1_le_branch(w1_le_ctx_t *ctx, const uint32_t *src,
     for (k = 0; k < tw * th; k++) modepix[k] = (uint32_t)ctx->uni_force << 8;
   }
   if (do_uni) {
-    static const int umodes_a2[2] = {1, 2};
-    static const int umodes_u[2] = {11, 1};
-    /* Small images rank every mode: the ranking seeds the portfolio of
-     * full encodes in w1_vp8l_encode_full, where the estimate margin that
-     * guards the adoption below cannot mislead. */
-    int all = n <= W1_LE_UNI_PORTFOLIO_MAXN;
-    const int *ulist = is_a2 ? umodes_a2 : umodes_u;
-    int nu = all ? 14 : 2, um;
+    int um;
     ctx->uni_n = 0;
-    for (um = 0; um < nu; um++) {
-      int m = all ? um : ulist[um], ux, uy, j;
+    for (um = 0; um < 14; um++) {
+      int m = um, ux, uy, j;
       uint64_t ue, umx;
       for (uy = 0; uy < th; uy++)
         for (ux = 0; ux < tw; ux++) {
@@ -7136,11 +8073,8 @@ static W1_UNUSED uint64_t w1_le_branch(w1_le_ctx_t *ctx, const uint32_t *src,
       for (k = 0; k < tw * th; k++) modepix[k] = (uint32_t)m << 8;
       umx = w1_le_estimate(ctx, modepix, tw, th, 1, 0, flat,
                            ctx->counts2) + 300;
-      ue = w1_le_est2(ctx, dst, w, h, sl, cache_bits, flat, ctx->counts4,
-                      ctx->counts);
-      if (!all || m == ulist[0] || m == ulist[1]) {
-        if (ue + umx < ubest_est) { ubest_est = ue + umx; ubest = m; }
-      }
+      ue = w1_le_est2(ctx, dst, w, h, W1_LE_UNI_RANK_SL, cache_bits, flat,
+                      ctx->counts4, ctx->counts);
       /* Insertion into the ranking (ascending estimate). */
       for (j = ctx->uni_n; j > 0 && ctx->uni_est[j - 1] > ue + umx; j--) {
         ctx->uni_est[j] = ctx->uni_est[j - 1];
@@ -7148,6 +8082,10 @@ static W1_UNUSED uint64_t w1_le_branch(w1_le_ctx_t *ctx, const uint32_t *src,
       }
       ctx->uni_est[j] = ue + umx; ctx->uni_rank[j] = m; ctx->uni_n++;
     }
+  }
+  if (ctx->rank_only) {         /* the ranking is all this run is for */
+    *use_pred = *use_color = 0;
+    return 0;
   }
   if (ctx->uni_force < 0) {
     /* pick_sb already ran this exact predict + resolve (same src, same sb,
@@ -7169,31 +8107,23 @@ static W1_UNUSED uint64_t w1_le_branch(w1_le_ctx_t *ctx, const uint32_t *src,
   }
   penalty = w1_le_estimate(ctx, modepix, tw, th, 1, 0, flat, ctx->counts) +
             300;
-  co = w1_le_estimate(ctx, src, w, h, sl, cache_bits, flat, ctx->counts2);
+  if (ctx->co_hint != (uint64_t)-1) {
+    co = ctx->co_hint;
+    ctx->co_hint = (uint64_t)-1;
+  } else
+    co = w1_le_estimate(ctx, src, w, h, sl, cache_bits, flat, ctx->counts2);
   cr = w1_le_estimate(ctx, dst, w, h, sl, cache_bits, flat, ctx->counts);
-  if (do_uni) {
-    /* cr's pass A just left its H1 lens in ctx->lens: iterate from there
-     * instead of repeating that pass. */
-    uint64_t cr2 = w1_le_est2_from(ctx, dst, w, h, sl, cache_bits,
-                                   ctx->counts);
-    if (ubest >= 0 && ubest_est + 64 < cr2 + penalty) {
-      int ux, uy;
-      for (uy = 0; uy < th; uy++)
-        for (ux = 0; ux < tw; ux++) {
-          w1_le_retile(src, dst, w, h, sb, ux, uy, ubest);
-          modes[uy * tw + ux] = (uint8_t)ubest;
-        }
-      for (k = 0; k < tw * th; k++) modepix[k] = (uint32_t)ubest << 8;
-      penalty = w1_le_estimate(ctx, modepix, tw, th, 1, 0, flat,
-                               ctx->counts2) + 300;
-      cr = w1_le_estimate(ctx, dst, w, h, sl, cache_bits, flat, ctx->counts);
-    }
-  }
   if (cr + penalty < co) {
     *use_pred = 1;
-    total = cr + penalty;
+    total = cr;
 #ifndef W1_NO_COLOR
-    *use_color = w1_le_color(ctx, dst, w, h, level, cache_bits, flat, ximg,
+    /* No colour search below 1/64 bit per pixel: over the grid, the real
+     * corpus and its quantizations (levels 6/8, 173 searches) it was
+     * adopted 18 times, never there (65 searches; stripes_v 1024 L6:
+     * 15 Mcycles). Level 9's pinned runs keep it (photo 512 adopts one
+     * there, 8 B). */
+    *use_color = (ctx->l9 || cr * 64 >= (uint64_t)n) &&
+                 w1_le_color(ctx, dst, w, h, level, cache_bits, flat, ximg,
                              cr, &total);
     total += penalty;
 #else
@@ -7273,6 +8203,95 @@ static W1_UNUSED void w1_le_pal_sort(uint32_t *tab, int ts) {
     while (j >= 0 && tab[j] > v) { tab[j + 1] = tab[j]; j--; }
     tab[j + 1] = v;
   }
+}
+
+/* Table sub-image bits of tab[0..ts) in this order: the delta-coded
+ * entries as literals under header-aware Huffman codes, one table per
+ * channel (a few-entry stream finds no copies worth their tables). */
+static W1_UNUSED uint64_t w1_le_pal_bits(const uint32_t *tab, int ts) {
+  int counts[280], tmp[5 * 280], seq[2 * 280], c, i;
+  uint8_t lens[280], best[280];
+  uint64_t t = 0;
+  for (c = 0; c < 4; c++) {
+    int n = c ? 256 : 280, sh = c == 0 ? 8 : c == 1 ? 16 : c == 2 ? 0 : 24;
+    uint32_t prev = 0;
+    w1_bw_t bw;
+    memset(counts, 0, sizeof counts);
+    for (i = 0; i < ts; i++) {
+      counts[(((tab[i] >> sh) & 0xffu) - ((prev >> sh) & 0xffu)) & 0xffu]++;
+      prev = tab[i];
+    }
+    if (w1_huff_lengths_hdr(counts, n, lens, tmp, seq, best) > 1)
+      for (i = 0; i < n; i++) t += (uint64_t)(unsigned)counts[i] * lens[i];
+    w1_bw_init(&bw, NULL, 0);
+    w1_huff_emit(&bw, lens, n, seq);
+    t += (uint64_t)bw.bytes * 8 + (uint64_t)bw.nbits;
+  }
+  return t;
+}
+
+/* Rough w1_le_pal_bits for the order search, in 1/16 bits: per channel a
+ * table header of ~20 + 9 bits per distinct delta (one or two deltas take
+ * the simple code) plus the deltas' entropy. */
+static W1_UNUSED int w1_le_pal_proxy(const uint32_t *tab, int ts) {
+  static const uint8_t lg[17] = {0,  0,  16, 25, 32, 37, 41, 45, 48,
+                                 51, 53, 55, 57, 59, 61, 63, 64};
+  int c, i, j, t = 0;
+  for (c = 0; c < 4; c++) {
+    int sh = c == 0 ? 8 : c == 1 ? 16 : c == 2 ? 0 : 24, m = 0;
+    uint32_t prev = 0, sym[16];
+    int cnt[16];
+    for (i = 0; i < ts; i++) {
+      uint32_t d = (((tab[i] >> sh) & 0xffu) - ((prev >> sh) & 0xffu)) & 0xffu;
+      prev = tab[i];
+      for (j = 0; j < m && sym[j] != d; j++) {}
+      if (j == m) { sym[m] = d; cnt[m++] = 0; }
+      cnt[j]++;
+    }
+    if (m == 1) continue;
+    t += m == 2 ? 18 * 16 : (20 + 9 * m) * 16;
+    for (j = 0; j < m; j++) t += cnt[j] * (lg[ts] - lg[cnt[j]]);
+  }
+  return t;
+}
+
+/* Table order: sorted by packed ARGB, then (few colours) segment reversals
+ * kept while the proxy above shrinks, adopted only when the exact table
+ * bits beat the sorted order's. Reversing a run of the sorted order reuses
+ * its deltas in the other direction and can drop a symbol from a
+ * channel's table (palette16: 343 -> 293 bits). */
+#ifndef W1_LE_PAL_ORDER_MAXTS
+#define W1_LE_PAL_ORDER_MAXTS 16
+#endif
+#ifndef W1_LE_PAL_ORDER_MIN
+#define W1_LE_PAL_ORDER_MIN 24
+#endif
+static W1_UNUSED void w1_le_pal_order(uint32_t *tab, int ts) {
+  uint32_t srt[W1_LE_PAL_ORDER_MAXTS];
+  int cur, pass, i, j, k, better = 1;
+  w1_le_pal_sort(tab, ts);
+  if (ts < 3 || ts > W1_LE_PAL_ORDER_MAXTS) return;
+  memcpy(srt, tab, (size_t)ts * sizeof(*tab));
+  cur = w1_le_pal_proxy(tab, ts);
+  for (pass = 0; pass < 4 && better; pass++) {
+    better = 0;
+    for (i = 0; i + 1 < ts; i++)
+      for (j = i + 1; j < ts; j++) {
+        int b2;
+        for (k = 0; k < (j - i + 1) / 2; k++) {
+          uint32_t t = tab[i + k]; tab[i + k] = tab[j - k]; tab[j - k] = t;
+        }
+        b2 = w1_le_pal_proxy(tab, ts);
+        if (b2 < cur) { cur = b2; better = 1; continue; }
+        for (k = 0; k < (j - i + 1) / 2; k++) {
+          uint32_t t = tab[i + k]; tab[i + k] = tab[j - k]; tab[j - k] = t;
+        }
+      }
+  }
+  if (memcmp(srt, tab, (size_t)ts * sizeof(*tab)) &&
+      w1_le_pal_bits(tab, ts) + W1_LE_PAL_ORDER_MIN >
+          w1_le_pal_bits(srt, ts))
+    memcpy(tab, srt, (size_t)ts * sizeof(*tab));
 }
 
 /* Pack px (w x h) as table indices into dst (new_w x h): A=0xff, R=B=0,
@@ -7363,11 +8382,14 @@ static W1_UNUSED int w1_le_alpha_uniform(const uint32_t *pix, int n) {
   return 1;
 }
 
-static W1_UNUSED int w1_le_hopeless(const uint32_t *pix, int w, int h) {
+/* entropy = 0 keeps only the dominant-bin tests: a pre-filter on a band of
+ * rows, where the floor-log2 scores below swing with the sample size. */
+static W1_UNUSED int w1_le_hopeless_m(const uint32_t *pix, int w, int h,
+                                      int entropy) {
   int hL[3][256], hT[3][256], hD[2][256], hR[3][256];
   int x, y, c, i;
   int64_t n = (int64_t)w * h;
-  int64_t nl, nt;
+  int64_t nl = n - h, nt = n - w, next = 16384;
   if (n < 4096) return 0;
   memset(hL, 0, sizeof hL);
   memset(hT, 0, sizeof hT);
@@ -7394,6 +8416,22 @@ static W1_UNUSED int w1_le_hopeless(const uint32_t *pix, int w, int h) {
         hT[2][(b - (int)(T & 0xff)) & 0xff]++;
       }
     }
+    /* The dominant-bin tests below only turn true as the counts grow, so
+     * one that already holds against the whole-frame thresholds settles
+     * the answer (0) mid-scan: structured frames stop after the first
+     * 16K pixels (stripes_v 512 L6: 2.4 Mcycles), broad-residual ones pay
+     * a 2K-bin sweep per 16K pixels. */
+    if ((int64_t)(y + 1) * w >= next) {
+      next += 16384;
+      for (c = 0; c < 3; c++)
+        for (i = 0; i < 256; i++) {
+          if (w > 1 && (int64_t)hL[c][i] * 256 >= nl * 2) return 0;
+          if (h > 1 && (int64_t)hT[c][i] * 256 >= nt * 2) return 0;
+        }
+      for (c = 0; c < 2; c++)
+        for (i = 0; i < 256; i++)
+          if ((int64_t)hD[c][i] * 256 >= n * 2) return 0;
+    }
   }
   /* A dominant residual bin means the predictor pays off in an obvious way.
    * Not having one does NOT mean prediction is useless: real photographs
@@ -7402,14 +8440,12 @@ static W1_UNUSED int w1_le_hopeless(const uint32_t *pix, int w, int h) {
    * max-bin-only test sent every such photo down the raw fast path, which
    * codes ~3x worse than a plain left-delta + order-0 Huffman would. Compare
    * the predictor entropy against the raw-channel entropy instead. */
-  for (c = 0; c < 3; c++) {
+  for (c = 0; c < 3 && entropy; c++) {
     uint64_t raw_c = w1_le_hscore(hR[c]);
     uint64_t bl = w1_le_hscore(hL[c]), bt = w1_le_hscore(hT[c]);
     if (w > 1 && bl * 64 < raw_c * 63) return 0;
     if (h > 1 && bt * 64 < raw_c * 63) return 0;
   }
-  nl = n - h;
-  nt = n - w;
   for (c = 0; c < 3; c++) {
     int ml = 0, mt = 0;
     for (i = 0; i < 256; i++) {
@@ -7425,6 +8461,10 @@ static W1_UNUSED int w1_le_hopeless(const uint32_t *pix, int w, int h) {
     if ((int64_t)md * 256 >= n * 2) return 0;
   }
   return 1;
+}
+
+static W1_UNUSED int w1_le_hopeless(const uint32_t *pix, int w, int h) {
+  return w1_le_hopeless_m(pix, w, h, 1);
 }
 
 #ifndef W1_LE_PAL_MAXN
@@ -7508,6 +8548,8 @@ static W1_UNUSED int w1_le_uniform_stream(w1_le_ctx_t *ctx,
   memset(modes, mode, (size_t)tw * th);
   w1_le_uniform_residual(src, res, w, h, sb, mode);
   cost = w1_le_estimate(ctx, res, w, h, level, cache_bits, flat, ctx->counts);
+  ctx->uni_last = cost;
+  if (cost > ctx->uni_cap) return -1;
   color = ximg ? w1_le_color(ctx, res, w, h, level, cache_bits, flat, ximg, cost, &cost) : 0;
   w1_le_emit_image(ctx, res, w, h, level, cache_bits, green, 1,
       color, sb, flat, modes, modepix, ximg, scratch, bw);
@@ -7573,7 +8615,27 @@ static W1_UNUSED unsigned w1_le_uniform_candidates(const uint32_t *pix,
   return mask;
 }
 
-static W1_UNUSED void w1_le_palette_stream(w1_le_ctx_t *ctx,
+/* 1 when modes a and b predict a 16x16 grid of interior samples alike:
+ * the cheap first test before comparing two uniform residuals whole. */
+static W1_UNUSED int w1_le_uniform_alike(const uint32_t *pix, int w, int h,
+                                         int a, int b) {
+  int sx, sy;
+  if (w < 2 || h < 2) return 1;
+  for (sy = 0; sy < 16; sy++) for (sx = 0; sx < 16; sx++) {
+    int x = 1 + (int)((int64_t)(w - 2) * sx / 15);
+    int y = 1 + (int)((int64_t)(h - 2) * sy / 15);
+    size_t at = (size_t)y * w + x;
+    uint32_t tr = x + 1 < w ? pix[at - w + 1] : pix[(size_t)y * w];
+    if (w1_vp8l_predict(a, pix[at - 1], pix[at - w], pix[at - w - 1], tr) !=
+        w1_vp8l_predict(b, pix[at - 1], pix[at - w], pix[at - w - 1], tr))
+      return 0;
+  }
+  return 1;
+}
+
+/* Returns -1, leaving bw part-written, when the pixel stream's estimate
+ * is over ctx->pal_cap. */
+static W1_UNUSED int w1_le_palette_stream(w1_le_ctx_t *ctx,
     const uint32_t *tab, int ts, const uint32_t *idx, uint32_t *res,
     int w, int h, int level, int cache_bits, int mode, const uint8_t *flat,
     uint32_t *modepix, w1_bw_t *bw) {
@@ -7600,10 +8662,57 @@ static W1_UNUSED void w1_le_palette_stream(w1_le_ctx_t *ctx,
     w1_le_encode_tokens(ctx, modepix, tw, th, 1, 0, flat, bw, NULL);
   }
   w1_bw_put(bw, 0, 1);
-  w1_le_estimate(ctx, img, w, h, level, cache_bits, flat, ctx->counts);
+  if (w1_le_estimate(ctx, img, w, h, level, cache_bits, flat, ctx->counts) >
+      ctx->pal_cap)
+    return -1;
   w1_le_scan_present(img, w * h, present);
   w1_le_stream(ctx, img, w, h, level, w1_le_depths[level], cache_bits,
       flat, present, NULL, bw);
+  return 0;
+}
+
+#ifndef W1_LE_PAL_SHORT_N
+#define W1_LE_PAL_SHORT_N 65536
+#endif
+#ifndef W1_LE_PAL_FORCE_TS
+#define W1_LE_PAL_FORCE_TS 2
+#endif
+/* 1 when orig has W1_LE_PAL_MINTS..W1_LE_PAL_FORCE_TS distinct colours
+ * (the count w1_le_pal_table_fast returns). With the force limit at 2 it
+ * is a two-colour scan that stops at the third colour, so wider palettes
+ * pay a few pixels, not a hashed pass. */
+static W1_UNUSED int w1_le_pal_few(const uint32_t *orig, int n) {
+  uint32_t a = orig[0], b = orig[0];
+  int k;
+  if (W1_LE_PAL_FORCE_TS != 2) {
+    uint32_t tab[256];
+    int ts = w1_le_pal_table_fast(orig, n, tab);
+    return ts >= W1_LE_PAL_MINTS && ts <= W1_LE_PAL_FORCE_TS;
+  }
+  for (k = 1; k < n; k++) {
+    uint32_t v = orig[k];
+    if (v == a || v == b) continue;
+    if (a != b) return 0;
+    b = v;
+  }
+  return a != b && W1_LE_PAL_MINTS <= 2;
+}
+
+#ifndef W1_LE_SG_MARGIN16
+#define W1_LE_SG_MARGIN16 15
+#endif
+/* w1_le_pal_table_fast(orig) once per w1_le_main: the palette-only test,
+ * the palette trials and the candidate loop all scan the same frame
+ * (palette16 1024: 2-3 scans of 2.5-7 Mcycles). *ts < -1 until the first
+ * call; cache keeps its table, copied to tab when it has <= 256 colours. */
+static W1_UNUSED int w1_le_pal_once(const uint32_t *orig, int n,
+                                    uint32_t *cache, int *ts, uint32_t *tab) {
+  if (*ts < -1) {
+    *ts = w1_le_pal_table_fast(orig, n, cache);
+    if (*ts <= 256) w1_le_pal_order(cache, *ts);
+  }
+  if (*ts <= 256) memcpy(tab, cache, (size_t)*ts * sizeof(*tab));
+  return *ts;
 }
 
 static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
@@ -7615,26 +8724,49 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
                                  uint32_t *modepix, uint32_t *ximg,
                                  w1_bw_t *bw) {
   int n = w * h, use_pred = 0, use_green = 0, use_color = 0, k;
+  uint32_t pal_tab[256];
+  int pal_ts = -2;
   w1_bw_t start = *bw;
   int pred_sb = 3;
   int cache_bits = (int)w1_le_cachebits[level];
   /* Estimate of the chosen ARGB stream below level 6 (feeds the palette
    * trial); (uint64_t)-1 = no trial (level 6+ has its own, uniform skips). */
   uint64_t main_est = (uint64_t)-1;
+  int main_mode = -1;         /* low effort: the plain stream's one mode */
+  /* Levels 0-5: pal_main = the main stream is the raw palette stream the
+   * candidate loop's first palette trial would repeat; pal_short = it was
+   * taken without the ARGB analysis (at most W1_LE_PAL_FORCE_TS colours). */
+  int pal_main = 0, pal_short = 0;
   int uniform = level >= 6 && w1_le_uniform(orig, n);
-  int hopeless = level >= 6 && !uniform && w1_le_hopeless(orig, w, h);
+  /* Below level 6 the probe runs only when a band of the top rows (>= 32K
+   * pixels, where no residual bin of noise nears the 2/256 line) has no
+   * dominant bin and alpha is uniform, so structured frames pay the band
+   * and the probe only feeds the literal path below (the rest of the L6
+   * fast path stays L6-only). Noise 512 L3: 90 ms of predictor, colour and
+   * LZ passes that end on the same bytes. */
+  int band = (32767 + w) / w;
+  int hopeless = !uniform &&
+                 (level >= 6 ||
+                  (!ctx->rank_only && band < h &&
+                   w1_le_hopeless_m(orig, w, band, 0) &&
+                   w1_le_alpha_uniform(orig, n))) &&
+                 w1_le_hopeless(orig, w, h);
   /* A cache larger than the image only inflates the green alphabet
    * (256+24+cache) and Huffman tables; clamp to image size. Fixes
    * L8/L9 regressing on tiny images (e.g. 16x16 went 414 -> 424). */
   while (cache_bits > 0 && (1 << cache_bits) > n) cache_bits--;
   const uint32_t *img = orig;
+  if (ctx->rank_only && (uniform || hopeless)) return;
   if (hopeless && w1_le_alpha_uniform(orig, n)) {
     w1_bw_put(bw, 0, 1);
     w1_le_literal_stream(ctx, orig, w, h, flat, predres, -1, bw);
     return;
   }
   if (level >= 6 && n >= 262144 && !uniform &&
-      w1_le_alpha_uniform(orig, n) && w1_le_smooth(orig, w, h)) {
+      w1_le_alpha_uniform(orig, n)) {
+    /* The grey test runs first: it stops at the first coloured pixel,
+     * while the smooth scan reads the whole frame before a grey one is
+     * turned away anyway (checker1 1024 L6: 15.7 of 37 Mcycles). */
     int gray = 1;
     for (k = 0; k < n; k++) {
       unsigned p = orig[k];
@@ -7644,13 +8776,15 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
         break;
       }
     }
-    if (!gray) {
+    if (!gray && w1_le_smooth(orig, w, h)) {
+      if (ctx->rank_only) return;
       w1_le_uniform_stream(ctx, orig, res, predres, w, h, level, cache_bits,
                            5, 12, 0, flat, modes, modepix, ximg, bw);
       goto candidates;
     }
   }
   if (level >= 6 && w1_le_alpha_rows(orig, w, h)) {
+    if (ctx->rank_only) return;
     w1_le_uniform_stream(ctx, orig, res, predres, w, h, level, cache_bits,
                          9, 1, 0, flat, modes, modepix, ximg, bw);
     goto candidates;
@@ -7668,7 +8802,15 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
      * sl = 1 as w1_le_branch's gates) pick the same A/B winner the full
      * search would, including its strict totB < totA tie-break. */
     int fast_raw = 0;
-    if (uniform || hopeless) {
+    if (uniform) {
+      /* One colour: both green histograms have zero entropy, so the gate
+       * keeps the image, and the stream is the literal one (see
+       * w1_le_stream), which reads no estimate. */
+      for (k = 0; k < n; k++) res[k] = orig[k];
+      use_green = 0;
+      img = res;
+      fast_raw = 1;
+    } else if (hopeless) {
       for (k = 0; k < n; k++) res[k] = orig[k];
       use_green = w1_le_sub_green(res, n, ctx->htmp);
       if (!use_green) {
@@ -7698,19 +8840,16 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
     int th3 = (h + (1 << W1_CT_SB) - 1) >> W1_CT_SB;
     int nx3 = tw3 * th3;
     int twm, thm, nxm;
-    int predB, colorB;
+    int predB, colorB, skip_g = 0;
     /* Palette-only shortcut: with at most W1_LE_PAL_FORCE_TS distinct
      * colours the indexed stream wins the trial below on every measured
      * fixture, so the ARGB branches (tile-size search, two predictor /
      * colour branches: 60-400 ms at 512x512) are skipped and the palette
      * trial is compared against an infinite ARGB cost. */
     int pal_only = 0;
-#ifndef W1_LE_PAL_FORCE_TS
-#define W1_LE_PAL_FORCE_TS 2
-#endif
     if (W1_LE_PAL_FORCE_TS > 0 && n <= W1_LE_PAL_MAXN) {
       uint32_t ptab0[256];
-      int ts0 = w1_le_pal_table_fast(orig, n, ptab0);
+      int ts0 = w1_le_pal_once(orig, n, pal_tab, &pal_ts, ptab0);
       pal_only = ts0 >= W1_LE_PAL_MINTS && ts0 <= W1_LE_PAL_FORCE_TS;
     }
     if (pal_only) {
@@ -7722,11 +8861,17 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
       totB = totA = (uint64_t)-1;
       for (k = 0; k < n; k++) res[k] = orig[k];
       use_green = 0; use_pred = 0; use_color = 0;
-      w1_le_estimate(ctx, res, w, h, level, cache_bits, flat, ctx->counts);
+      /* The ARGB estimate (ctx->counts for res) is only read if the
+       * palette trial below falls back, so it is taken there. */
     } else {
+    /* A forced uniform mode makes the residual independent of the tile
+     * size (only the one-symbol mode image changes), so the tile-size
+     * search is skipped for the coarsest tiling. */
     pred_sb = ctx->sb_hint >= 0
                   ? ctx->sb_hint
-                  : level >= 9
+                  : ctx->uni_force >= 0
+                      ? W1_LE_UNI_SB
+                  : ctx->l9
                       ? w1_le_pick_sb(ctx, orig, predres, w, h, level,
                                       cache_bits, flat, modes, modepix,
                                       &ctx->sb_alt)
@@ -7747,24 +8892,34 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
         for (k = 0; k < nx3; k++) svximg[k] = ximg[k];
       for (k = 0; k < W1_LE_NC; k++) ctx->counts3[k] = ctx->counts[k];
     }
-    if (ctx->sg_force != 0) {
+    /* Below 1/64 bit per pixel on the plain branch the green one is not
+     * run: over the grid, the real corpus and its quantizations (levels
+     * 6/8, 274 duels) it won there once (palette64 256, whose palette
+     * stream is what gets coded), and it cost stripes_v 1024 a full
+     * predictor search. As with a forced plain branch, B is taken. */
+    if (ctx->sg_force < 0 && totB * 64 < (uint64_t)n) skip_g = 1;
+    if (ctx->sg_force != 0 && !skip_g) {
       for (k = 0; k < n; k++) res[k] = orig[k];
       use_green = w1_le_sub_green_m(res, n, ctx->htmp,
                                     ctx->sg_force == 1 ? -1
                                                        : W1_LE_SG_KEEP16);
-      totA = w1_le_branch(ctx, res, predres, res, w, h, level, cache_bits,
-                          pred_sb, flat, modes, modepix, ximg,
-                          &use_pred, &use_color);
+      /* Green declined: res is orig again, so branch A would repeat
+       * branch B on the same image and tie it, and the margin below keeps
+       * B on a tie (alpha_sweep, photo 256, art_tileset: one full
+       * predictor search each). */
+      if (!use_green && ctx->sg_force < 0 && W1_LE_SG_MARGIN16 <= 16)
+        totA = totB;
+      else
+        totA = w1_le_branch(ctx, res, predres, res, w, h, level, cache_bits,
+                            pred_sb, flat, modes, modepix, ximg,
+                            &use_pred, &use_color);
     }
     }
-#ifndef W1_LE_SG_MARGIN16
-#define W1_LE_SG_MARGIN16 15
-#endif
     /* Require subtract-green to win by a clear margin: the depth-640
      * estimates still differ from the adapted-table cost by a few percent,
      * so near-ties can flip to the wrong branch (e.g. gradient128; a raw
      * win measured 4 bytes smaller than the estimate's green pick). */
-    if (!pal_only && (ctx->sg_force == 0 ||
+    if (!pal_only && (ctx->sg_force == 0 || skip_g ||
                       (ctx->sg_force < 0 &&
                        !(totA * 16 < totB * W1_LE_SG_MARGIN16)))) {
       for (k = 0; k < n; k++) res[k] = resB[k];
@@ -7787,7 +8942,7 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
      * and fall through bit-identical. */
     if (n <= W1_LE_PAL_MAXN) {
       uint32_t ptab[256];
-      int ts = w1_le_pal_table_fast(orig, n, ptab);
+      int ts = w1_le_pal_once(orig, n, pal_tab, &pal_ts, ptab);
       if (ts >= W1_LE_PAL_MINTS && ts <= 256) {
         int wb;
         int new_w;
@@ -7795,7 +8950,6 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
         int lvl = w1_le_idx_level(level);
         int twi = 0, thi = 0, useP = 0, useC = 0, k2, i2;
         uint64_t tbl_est, totP, totW = totB < totA ? totB : totA;
-        w1_le_pal_sort(ptab, ts);
         wb = w1_le_pal_wb(ts);
         new_w = (w + (1 << wb) - 1) >> wb;
         n_idx = new_w * h; cb_idx = cache_bits;
@@ -7811,13 +8965,48 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
         if (use_color)
           for (k2 = 0; k2 < nx3; k2++) svximg[k2] = ximg[k2];
         for (k2 = 0; k2 < W1_LE_NC; k2++) ctx->counts3[k2] = ctx->counts[k2];
-        /* NULL: this trial is not the stream the sb duel re-encodes, so a
-         * refined pick from it would be scored against the wrong image. */
-        sb_idx = w1_le_pick_sb(ctx, predres, resB, new_w, h, lvl, cb_idx,
-                               flat, modes, modepix, NULL);
-        totP = w1_le_branch(ctx, predres, resB, resB, new_w, h, lvl, cb_idx,
-                            sb_idx, flat, modes, modepix, ximg, &useP, &useC);
+        /* The branch adopts the predictor only when the residual estimate
+         * plus the mode image's (itself + 300) is below the raw estimate,
+         * so a raw estimate of at most 300 bits settles it before the
+         * tile-size search and the predict (two-colour frames: checker1
+         * 512 raw 145 bits, 20 of 35 Mcycles at level 6 in pick_sb).
+         * The raw estimate is handed to the branch otherwise. The rank-only
+         * and forced-mode runs keep the branch: they use its other work. */
+        sb_idx = -1;
+        totP = 0;
+        if (!ctx->rank_only && ctx->uni_force < 0) {
+          uint64_t co_idx = w1_le_estimate(ctx, predres, new_w, h, lvl,
+                                           cb_idx, flat, ctx->counts2);
+          if (co_idx <= 300) {
+            for (k2 = 0; k2 < W1_LE_NC; k2++)
+              ctx->counts[k2] = ctx->counts2[k2];
+            for (k2 = 0; k2 < n_idx; k2++) resB[k2] = predres[k2];
+            useP = useC = 0;
+            sb_idx = 3;
+            totP = co_idx;
+          } else
+            ctx->co_hint = co_idx;
+        }
+        if (sb_idx < 0) {
+          /* NULL: this trial is not the stream the sb duel re-encodes, so
+           * a refined pick from it would be scored against the wrong
+           * image. Levels 7-8 keep the search below 256x256 index pixels:
+           * art_pack quantized to 12 colours (64x128 indices) gained 12 B
+           * there on the fixed size, the search costs little that small,
+           * and no larger frame of the quantized corpus moved. */
+          sb_idx = ctx->uni_force >= 0
+                       ? W1_LE_UNI_SB
+                       : !ctx->l9 && (level == 6 || n_idx >= 65536)
+                           ? 5
+                           : w1_le_pick_sb(ctx, predres, resB, new_w, h,
+                                           lvl, cb_idx, flat, modes, modepix,
+                                           NULL);
+          totP = w1_le_branch(ctx, predres, resB, resB, new_w, h, lvl,
+                              cb_idx, sb_idx, flat, modes, modepix, ximg,
+                              &useP, &useC);
+        }
         totP += tbl_est + 300;
+        if (ctx->rank_only) return;
 
         /* No useP requirement: the branch's own pred/raw gate decides; a
          * raw-index win emits palette-only (loses on sand/pal64, where the
@@ -7864,9 +9053,13 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
           for (k2 = 0; k2 < nxm; k2++) modes[k2] = svmodes[k2];
         if (use_color)
           for (k2 = 0; k2 < nx3; k2++) ximg[k2] = svximg[k2];
-        for (k2 = 0; k2 < W1_LE_NC; k2++) ctx->counts[k2] = ctx->counts3[k2];
+        if (pal_only)
+          w1_le_estimate(ctx, res, w, h, level, cache_bits, flat, ctx->counts);
+        else
+          for (k2 = 0; k2 < W1_LE_NC; k2++) ctx->counts[k2] = ctx->counts3[k2];
       }
     }
+    if (ctx->rank_only) return;
     img = res;
     }
   } else if (w1_le_uniform(orig, n)) {
@@ -7878,6 +9071,20 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
       img = res;
     }
     w1_le_estimate(ctx, img, w, h, level, cache_bits, flat, ctx->counts);
+  } else if (n >= W1_LE_PAL_SHORT_N && n <= W1_LE_PAL_MAXN &&
+             w1_le_pal_few(orig, n)) {
+    /* Two colours from 256x256 (levels 0-5): the level-6 palette-only
+     * shortcut again. The ARGB analysis below (green, predictor search,
+     * three LZ-aware estimates) is about 60-85% of these encodes (text
+     * 512 L3: 29 of 45 Mcycles) and its stream loses to the packed indices
+     * at every such size measured: checker1/checker8/stripes_h/text 256
+     * and 512 at L0-5 end on the palette stream, and no uniform-mode ARGB
+     * trial wins after it. Below 256x256 the palette's fixed cost can lose
+     * (checker1 64 L3: ARGB 136 bits, palette 193), so they keep the duel.
+     * The main estimate is left unbounded so the palette trial is taken,
+     * and the uniform-mode ARGB trials are skipped. */
+    main_est = (uint64_t)-2;
+    pal_short = 1;
   } else if (level >= W1_LE_MID_LEVEL) {
     /* Mid effort: subtract-green when it helps, then the per-tile spatial
      * predictor at one tile size (32x32), adopted when the LZ-aware
@@ -7902,7 +9109,11 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
     if (cr + penalty < co) {
       use_pred = 1;
       img = predres;
-      if (level >= 4) {
+      /* The colour trial (a counting emit, the colour search, a second
+       * emit) is skipped below 1/64 bit per pixel: over the grid, the real
+       * corpus and its quantizations (levels 4/5, 97 trials) it was kept 8
+       * times, never there (stripes_v 1024 L4: 41 -> 29 ms). */
+      if (level >= 4 && cr * 64 >= (uint64_t)n) {
         w1_bw_t original;
         uint64_t color_cost;
         w1_bw_init(&original, NULL, 0);
@@ -7951,13 +9162,10 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
         ? w1_le_sub_green_m(res, n, ctx->htmp,
                             w1_le_depths[level] <= 32 ? 12 : 16)
         : 0;
-    if (level == 2) {
-      /* Lv2 only: full 14-mode search at same sb=9 (usually 1 tile).
-       * NULL tiebuf skips resolve; gate/threshold/counts unchanged.
-       * Lv0/1 keep fixed Select; lv>=3 never reaches here. */
-      w1_le_predict(ctx, res, predres, w, h, pred_sb, modes,
-                    W1_LE_PRED_BONUS, NULL, NULL);
-    } else {
+    {
+      /* Each challenger's residual goes to resB and is copied over only
+       * when it wins, so the kept residual is never recomputed (stripes_v
+       * 1024 L1: the mode-11 restore was one 12.5 Mcycle pass of 108). */
       uint64_t cr11, cr12;
       for (ty = 0; ty < thm; ty++) for (tx = 0; tx < twm; tx++) {
         modes[ty * twm + tx] = 11;
@@ -7965,28 +9173,59 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
       }
       cr11 = w1_le_estimate(ctx, predres, w, h, level, cache_bits, flat,
                             ctx->counts);
+      /* counts4 keeps the counts of predres's estimate, so cr below
+       * re-scores them instead of a fourth LZ pass over the same pixels
+       * (palette16 1024 L0: 10 of 108 Mcycles). */
+      memcpy(ctx->counts4, ctx->counts, W1_LE_NC * sizeof(int));
       /* mode 12 = addsub_full(L,T,TL): exact on separable-linear ramps. */
-      for (ty = 0; ty < thm; ty++) for (tx = 0; tx < twm; tx++) {
-        modes[ty * twm + tx] = 12;
-        w1_le_retile(res, predres, w, h, pred_sb, tx, ty, 12);
-      }
-      cr12 = w1_le_estimate(ctx, predres, w, h, level, cache_bits, flat,
+      for (ty = 0; ty < thm; ty++) for (tx = 0; tx < twm; tx++)
+        w1_le_retile(res, resB, w, h, pred_sb, tx, ty, 12);
+      cr12 = w1_le_estimate(ctx, resB, w, h, level, cache_bits, flat,
                             ctx->counts);
-      if (!(cr12 * 64 < cr11 * 63)) {          /* need >1.56% to flip */
-        for (ty = 0; ty < thm; ty++) for (tx = 0; tx < twm; tx++) {
-          modes[ty * twm + tx] = 11;
-          w1_le_retile(res, predres, w, h, pred_sb, tx, ty, 11);
+      if (cr12 * 64 < cr11 * 63) {             /* need >1.56% to flip */
+        for (k = 0; k < twm * thm; k++) modes[k] = 12;
+        for (k = 0; k < n; k++) predres[k] = resB[k];
+        memcpy(ctx->counts4, ctx->counts, W1_LE_NC * sizeof(int));
+      } else {
+        cr12 = cr11;
+      }
+      uint32_t ptab2[256];
+      /* Lv2 also runs the full 14-mode search at sb=9 (NULL tiebuf skips
+       * resolve), kept only when its LZ-aware estimate beats the 11/12
+       * duel: its per-tile residual metric picked mode 12 on mixed and
+       * edges 512, 32004 / 1764 B where the duel's 11 codes 23654 / 1358.
+       * Past 64K pixels it is skipped below 1/64 bit per pixel or at
+       * <= 256 colours: there the palette trial or the uniform trials after
+       * the emit decide, and the search never moved a byte (stripes_v 1024
+       * L2: 130 of 244 Mcycles; palette16 and gray_ramp 1024: 26 / 51 ms). */
+      if (level == 2 &&
+          (n <= 65536 || (cr12 * 64 >= (uint64_t)n &&
+                          w1_le_pal_once(orig, n, pal_tab, &pal_ts,
+                                         ptab2) > 256))) {
+        int m0 = modes[0];
+        w1_le_predict(ctx, res, resB, w, h, pred_sb, modes,
+                      W1_LE_PRED_BONUS, NULL, NULL);
+        if (w1_le_estimate(ctx, resB, w, h, level, cache_bits, flat,
+                           ctx->counts) >= cr12)
+          for (k = 0; k < twm * thm; k++) modes[k] = (uint8_t)m0;
+        else {
+          for (k = 0; k < n; k++) predres[k] = resB[k];
+          memcpy(ctx->counts4, ctx->counts, W1_LE_NC * sizeof(int));
         }
       }
     }
     co = w1_le_estimate(ctx, res, w, h, level, cache_bits, flat,
                         ctx->counts2);
-    cr = w1_le_estimate(ctx, predres, w, h, level, cache_bits, flat,
-                        ctx->counts);
+    memcpy(ctx->counts, ctx->counts4, W1_LE_NC * sizeof(int));
+    cr = w1_le_score(ctx, ctx->counts, cache_bits ? 1 << cache_bits : 0);
     if (cr + 400 < co) {
       use_pred = 1;
       img = predres;
       main_est = cr + 400;
+      if (!use_green) {
+        for (k = 1; k < twm * thm && modes[k] == modes[0]; k++) {}
+        if (k == twm * thm) main_mode = modes[0];
+      }
     } else {
       for (k = 0; k < W1_LE_NC; k++) ctx->counts[k] = ctx->counts2[k];
       img = res;
@@ -8000,7 +9239,7 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
    * hashed colour scan is one O(n) pass and bails at 257 colours. */
   if (main_est != (uint64_t)-1 && n <= W1_LE_PAL_MAXN) {
     uint32_t ptab[256];
-    int ts = w1_le_pal_table_fast(orig, n, ptab);
+    int ts = w1_le_pal_once(orig, n, pal_tab, &pal_ts, ptab);
     if (ts >= W1_LE_PAL_MINTS && ts <= 256) {
       uint32_t dtab[256];
       uint32_t *idx = img == res ? predres : res;
@@ -8009,7 +9248,6 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
       int lvl = w1_le_idx_level(level);
       uint64_t tbl_est, pal_est;
       while (cb_idx > 0 && (1 << cb_idx) > n_idx) cb_idx--;
-      w1_le_pal_sort(ptab, ts);
       w1_le_pal_pack(orig, w, h, ptab, ts, wb, new_w, idx);
       w1_le_pal_delta(ptab, ts, dtab);
       for (k = 0; k < W1_LE_NC; k++) ctx->counts3[k] = ctx->counts[k];
@@ -8032,6 +9270,8 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
         w1_le_stream(ctx, idx, new_w, h, lvl, (int)w1_le_depths[lvl],
                      cb_idx, flat, presentP,
                      idx == res ? predres : res, bw);
+        main_mode = -1;
+        pal_main = 1;
         goto candidates;
       }
       for (k = 0; k < W1_LE_NC; k++) ctx->counts[k] = ctx->counts3[k];
@@ -8041,15 +9281,16 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
     w1_le_emit_image(ctx, img, w, h, level, cache_bits, use_green,
         use_pred, use_color, pred_sb, flat, modes, modepix, ximg, predres, bw);
     if ((level < 3 && !w1_le_alpha_uniform(orig, n)) ||
-        (level >= 9 && n >= 65536 && !w1_le_uniform(orig, n) && w1_le_smooth(orig, w, h))) {
+        (ctx->l9 && !w1_le_uniform(orig, n) && w1_le_smooth(orig, w, h))) {
       static const int candidates[4] = {1, 2, 12, 13};
       int trial_sb = level < 3 ? 9 : 5;
+      main_mode = -1;
       uint32_t *trial_res = level < 3 ? res : resB;
       uint64_t best = bw->err ? UINT64_MAX : w1_bw_bit_size(bw) - w1_bw_bit_size(&start);
       int i, green, best_mode = -1, best_green = 0;
       int last_mode = -1, last_green = 0, last_flags = 0;
-      for (green = 0; green < (level >= 9 ? 2 : 1); green++)
-        for (i = 0; i < (level >= 9 ? 4 : 2); i++) {
+      for (green = 0; green < (ctx->l9 ? 2 : 1); green++)
+        for (i = 0; i < (ctx->l9 ? 4 : 2); i++) {
         w1_bw_t trial;
         uint8_t *park = w1_bw_trial(&start, bw, &trial);
         uint64_t cost;
@@ -8078,33 +9319,113 @@ static W1_UNUSED void w1_le_main(w1_le_ctx_t *ctx, const uint32_t *orig,
 candidates:
   if (ctx->sg_force >= 0 || ctx->sb_hint >= 0 ||
       ctx->pal_force >= 0 || ctx->uni_force >= 0) return;
-  if (level < 9 && n >= 64 && !w1_le_uniform(orig, n)) {
+  if (level < 9 && n >= 64 && !pal_short && !w1_le_uniform(orig, n)) {
     unsigned mask = w1_le_uniform_candidates(orig, w, h, level < 3 ? 2 : 3);
     int mode, best_mode = -1, alpha = !w1_le_alpha_uniform(orig, n);
+    int green, best_green = 0, try_mode = -1, prev_mode = -1;
     uint64_t best = bw->err ? UINT64_MAX : w1_bw_bit_size(bw) - w1_bw_bit_size(&start);
+    uint64_t try_cost = UINT64_MAX, try_est = 0;
     if (alpha) mask |= (1u << 1) | (1u << 2);
     if (level < 3 && alpha) mask &= ~((1u << 1) | (1u << 2));
-    for (mode = 0; mode < 14; mode++) if (mask & (1u << mode)) {
-      w1_bw_t trial;
-      uint8_t *park = w1_bw_trial(&start, bw, &trial);
-      uint64_t cost;
-      w1_le_uniform_stream(ctx, orig, res, predres, w, h, level,
-          cache_bits, 9, mode, 0, flat, modes, modepix, NULL, &trial);
-      cost = w1_bw_bit_size(&trial) - w1_bw_bit_size(&start);
-      if (!trial.err && cost < best) {
-        best = cost; best_mode = mode;
-        if (park) { w1_bw_adopt(&start, bw, &trial, park); best_mode = -1; }
+    /* Select (11) is always a candidate from level 3: the sampled
+     * entropy ranking above cannot see LZ, and Select's win is exact
+     * repeats (edges 64 L3-8: tiled 12 352 B, uniform 11 250 B, lib 338;
+     * edges 512 L3 1742 -> 1364). Levels 3-5 first ask the LZ-aware
+     * estimate to beat the main stream's; 6-8 skip that gate, where the
+     * estimate still prefers the tiled stream the finished trial beats. */
+    if (level >= 3 && !(mask & (1u << 11))) {
+      if (level >= 6) mask |= 1u << 11;
+      else if (main_est != (uint64_t)-1) {
+        w1_le_uniform_residual(orig, res, w, h, 9, 11);
+        if (w1_le_estimate(ctx, res, w, h, level, cache_bits, flat,
+                           ctx->counts) < main_est)
+          mask |= 1u << 11;
       }
     }
+    /* Low effort already coded one uniform mode without green: that stream
+     * is the plain trial of its mode, so the green retry starts from it.
+     * The mask need not hold it (mixed 512 L0: mask {2, 12}, main mode 11),
+     * and the retry of the mask's best mode missed the pair the reference
+     * codes, green + Select (31672 vs 25288 B). */
+    if (main_mode >= 0 && best != UINT64_MAX) {
+      try_mode = main_mode; try_cost = best; try_est = main_est - 400;
+      mask &= ~(1u << main_mode);
+    }
+    /* The cheapest mode is retried with subtract-green (the green = 1
+     * pass). The pinned-green duel re-encode returns above, so without it a
+     * grey frame never gets one predictor tile and zero R/B residuals
+     * together (gray_ramp 128 L3-8: 50 B, lib 46 B; mixed 256 L3: 7164 ->
+     * 6430 B). The retry is emitted only when the plain trial's exact size,
+     * scaled by the green/plain LZ-aware estimate ratio, would beat the
+     * best so far: noise never gains, the clamped modes code wrapped
+     * R-G/B-G far worse (mixed 128 L0 mode 12: 30360 -> 80793 bits), and on
+     * text and checkers one tile loses to the tiled predictors either way. */
+    for (green = 0; green < 2; green++)
+      for (mode = 0; mode < 14; mode++) {
+        w1_bw_t trial;
+        uint8_t *park;
+        uint64_t cost;
+        if (green ? mode != try_mode : !((mask >> mode) & 1u)) continue;
+        if (green) {
+          uint64_t est;
+          for (k = 0; k < n; k++) predres[k] = orig[k];
+          w1_le_sub_green_m(predres, n, ctx->htmp, -1);
+          w1_le_uniform_residual(predres, res, w, h, 9, mode);
+          est = w1_le_estimate(ctx, res, w, h, level, cache_bits, flat,
+                               ctx->counts);
+          if ((double)try_cost * (double)est > (double)best * (double)try_est)
+            break;
+        }
+        /* The uniform mode image is coded by w1_le_uniform_tokens: one
+         * symbol per channel whatever the tile count, the green one 8 bits
+         * for every mode above 1. So a plain trial whose residual matches
+         * the previous plain trial's (still in res) codes the same stream
+         * and cannot beat it (stripes_v 512: Top, Select and
+         * ClampAddSubtractFull all 1056 bits, 4 Mcycles each; 1024: 2x2
+         * tiles, 132 -> 94 ms). */
+        if (!green && prev_mode >= 0 &&
+            (mode > 1) == (prev_mode > 1) &&
+            w1_le_uniform_alike(orig, w, h, prev_mode, mode)) {
+          w1_le_uniform_residual(orig, predres, w, h, 9, mode);
+          if (!memcmp(predres, res, (size_t)n * sizeof(*res))) continue;
+        }
+        if (!green) prev_mode = mode;
+        park = w1_bw_trial(&start, bw, &trial);
+        /* Levels 3-8 drop a plain trial whose LZ-aware estimate is over
+         * 23/20 of the best exact size: across the fills and the real set
+         * no winner estimated above 0.95 of it, and the estimate overshoots
+         * the finished trial by at most 1/0.907, so the dropped trials
+         * code >= 1.108x best (L6-8: 45% of the trial time). Levels 0-2
+         * keep them (winners up to 1.028), and so does level 9's portfolio
+         * (overshoot to 1/0.584). */
+        ctx->uni_cap = !green && level >= 3 && !ctx->l9 &&
+                       best < (uint64_t)-1 / 23
+                           ? best * 23 / 20 : (uint64_t)-1;
+        if (w1_le_uniform_stream(ctx, orig, res, predres, w, h, level,
+                cache_bits, 9, mode, green, flat, modes, modepix, NULL,
+                &trial) < 0) {
+          ctx->uni_cap = (uint64_t)-1;
+          continue;
+        }
+        ctx->uni_cap = (uint64_t)-1;
+        cost = w1_bw_bit_size(&trial) - w1_bw_bit_size(&start);
+        if (!trial.err && cost < try_cost) {
+          try_cost = cost; try_mode = mode; try_est = ctx->uni_last;
+        }
+        if (!trial.err && cost < best) {
+          best = cost; best_mode = mode; best_green = green;
+          if (park) { w1_bw_adopt(&start, bw, &trial, park); best_mode = -1; }
+        }
+      }
     if (best_mode >= 0) {
       *bw = start;
       w1_le_uniform_stream(ctx, orig, res, predres, w, h, level,
-          cache_bits, 9, best_mode, 0, flat, modes, modepix, NULL, bw);
+          cache_bits, 9, best_mode, best_green, flat, modes, modepix, NULL, bw);
     }
   }
   if (level < 9 && n >= 64 && n <= W1_LE_PAL_MAXN && !w1_le_uniform(orig, n)) {
     uint32_t tab[256];
-    int ts = w1_le_pal_table_fast(orig, n, tab);
+    int ts = w1_le_pal_once(orig, n, pal_tab, &pal_ts, tab);
     if (ts >= W1_LE_PAL_MINTS && ts <= 256) {
       static const int candidates[4] = {-1, 1, 2, 12};
       int wb = w1_le_pal_wb(ts), nw = (w + (1 << wb) - 1) >> wb;
@@ -8113,20 +9434,29 @@ candidates:
       uint64_t best = bw->err ? UINT64_MAX : w1_bw_bit_size(bw) - w1_bw_bit_size(&start);
       if (lvl > 5) lvl = 5;
       while (cb > 0 && (1 << cb) > nw * h) cb--;
-      w1_le_pal_sort(tab, ts);
       w1_le_pal_pack(orig, w, h, tab, ts, wb, nw, res);
-      for (i = 0; i < 4; i++) {
+      /* The raw trial (-1) at this level is the main palette stream when
+       * that was taken: same indices, level, depth, cache and counts. */
+      for (i = pal_main; i < 4; i++) {
         w1_bw_t trial;
         uint8_t *park = w1_bw_trial(&start, bw, &trial);
         uint64_t cost;
-        w1_le_palette_stream(ctx, tab, ts, res, predres, nw, h, lvl,
-            cb, candidates[i], flat, modepix, &trial);
+        /* A trial whose pixel-stream estimate is over 7/5 of the best
+         * exact size is dropped: across the fills, the real set and the
+         * quantised photos no winner estimated above 1.22x it, and a
+         * finished trial codes at least 0.75x its estimate, so the dropped
+         * ones code >= 1.05x best (gray_ramp, text, palette16 mode 12). */
+        ctx->pal_cap = best < (uint64_t)-1 / 7 ? best * 7 / 5 : (uint64_t)-1;
+        if (w1_le_palette_stream(ctx, tab, ts, res, predres, nw, h, lvl,
+                cb, candidates[i], flat, modepix, &trial) < 0)
+          continue;
         cost = w1_bw_bit_size(&trial) - w1_bw_bit_size(&start);
         if (!trial.err && cost < best) {
           best = cost; best_mode = candidates[i];
           if (park) { w1_bw_adopt(&start, bw, &trial, park); best_mode = -2; }
         }
       }
+      ctx->pal_cap = (uint64_t)-1;
       if (best_mode != -2) {
         *bw = start;
         w1_le_palette_stream(ctx, tab, ts, res, predres, nw, h, lvl,
@@ -8160,20 +9490,24 @@ static W1_UNUSED int w1_le_make_ctx(w1_bump_t *bump, int max_n,
   ctx->sv_dst = (uint32_t *)w1_bump_alloc(bump, (size_t)max_n * 4, 4);
   ctx->sv_modes = (uint8_t *)w1_bump_alloc(bump, (size_t)max_n, 1);
   ctx->sv_ok = 0; ctx->sv_src = NULL; ctx->sv_sum = 0;
+  ctx->pm = NULL; ctx->sm = NULL;
+  ctx->co_hint = (uint64_t)-1;
   ctx->sv_w = ctx->sv_h = ctx->sv_sb = ctx->sv_level = ctx->sv_cb = -1;
-  ctx->tab_lru = 0;
+  ctx->tab_lru = 0; ctx->tab_clock = 0;
   for (i = 0; i < 2; i++) {
     ctx->tab[i] = (uint32_t *)w1_bump_alloc(bump, (size_t)max_n * 4, 4);
     ctx->near[i] = NULL;
     ctx->tab_valid[i] = 0;
-    ctx->tab_uses[i] = 0;
+    ctx->tab_hit[i] = 0; ctx->tab_last[i] = 0;
     ctx->tk[i].tok = (uint32_t *)w1_bump_alloc(bump, (size_t)max_n * 4, 4);
     ctx->tk[i].lens =
         (uint8_t *)w1_bump_alloc(bump, (size_t)W1_LE_MAXG * W1_LE_NC, 1);
     ctx->tk[i].valid = 0;
     if (!ctx->tab[i] || !ctx->tk[i].tok || !ctx->tk[i].lens) return 0;
   }
-  ctx->uni_force = -1; ctx->uni_n = 0;
+  ctx->uni_force = -1; ctx->uni_n = 0; ctx->l9 = 0; ctx->rank_only = 0;
+  ctx->uni_cap = (uint64_t)-1;
+  ctx->pal_cap = (uint64_t)-1;
   ctx->sg_force = -1; ctx->sg_used = -1;
   ctx->pal_force = -1; ctx->pal_seen = 0;
   ctx->sb_hint = -1; ctx->sb_used = -1; ctx->sb_alt = -1;
@@ -8187,15 +9521,15 @@ static W1_UNUSED int w1_le_make_ctx(w1_bump_t *bump, int max_n,
   ctx->htmp = (int *)w1_bump_alloc(bump, (size_t)5 * W1_LE_NG * 4, 4);
   ctx->cache = (uint32_t *)w1_bump_alloc(bump, 2048 * 4, 4);
   ctx->phist = (int *)w1_bump_alloc(bump, (size_t)14 * 1024 * 4, 4);
+  ctx->pcost = (int64_t *)w1_bump_alloc(bump, (size_t)W1_LE_PC_TILES * 14 * 8, 8);
   ctx->gcounts = (int *)w1_bump_alloc(bump, (size_t)W1_LE_MAXG * W1_LE_NC * 4, 4);
   ctx->grcounts = (int *)w1_bump_alloc(bump, (size_t)W1_LE_MAXG * W1_LE_NC * 4, 4);
   ctx->glens = (uint8_t *)w1_bump_alloc(bump, (size_t)W1_LE_MAXG * W1_LE_NC, 1);
   ctx->gcodes = (int *)w1_bump_alloc(bump, (size_t)W1_LE_MAXG * W1_LE_NC * 4, 4);
-  /* Optimal-parse scratch: 8 B/px, when the caller's effort tier allows it
-   * and the image is within the cap (bigger ones keep the greedy+lazy
-   * tokenizer). Missing arena -> greedy. */
+  /* Optimal-parse scratch (dp + back + two near tables, 16 B/px) for the
+   * run that asked for the DP. Missing arena -> greedy. */
   ctx->dp = NULL; ctx->back = NULL; ctx->opt_cap = 0;
-  if (opt_parse && max_n <= W1_LZ_OPT_MAXN) {
+  if (opt_parse) {
     ctx->dp = (uint32_t *)w1_bump_alloc(bump, ((size_t)max_n + 1) * 4, 4);
     ctx->back = (uint32_t *)w1_bump_alloc(bump, ((size_t)max_n + 1) * 4, 4);
     if (ctx->dp && ctx->back) ctx->opt_cap = max_n;
@@ -8207,13 +9541,17 @@ static W1_UNUSED int w1_le_make_ctx(w1_bump_t *bump, int max_n,
     }
   }
   flat = (uint8_t *)w1_bump_alloc(bump, W1_LE_NC, 1);
+  ctx->tab_s = (uint32_t *)w1_bump_alloc(bump, W1_LZ_SMALL_N * 4, 4);
+  ctx->near_s = (uint32_t *)w1_bump_alloc(bump, W1_LZ_SMALL_N * 4, 4);
+  if (!ctx->near_s) ctx->tab_s = NULL;
+  ctx->tab_s_valid = 0;
   if (!ctx->cand.list || !ctx->cand.slot || !ctx->cand.off || !ctx->cand.cur ||
       !ctx->cand.head ||
       !ctx->counts || !ctx->counts2 ||
       !ctx->counts3 || !ctx->counts4 ||
       !ctx->lens ||
       !ctx->codes || !ctx->seq || !ctx->htmp || !ctx->cache ||
-      !ctx->phist || !ctx->gcounts || !ctx->grcounts || !ctx->glens ||
+      !ctx->phist || !ctx->pcost || !ctx->gcounts || !ctx->grcounts || !ctx->glens ||
       !ctx->gcodes || !flat)
     return 0;
   for (i = 0; i < W1_LE_NC; i++) flat[i] = 8;
@@ -8250,6 +9588,10 @@ typedef struct {
   int sb_alt;      /* out: runner-up tile size worth a re-encode, else -1 */
   int pal_force;   /* in:  1 accepts the palette trial whenever it exists */
   int pal_seen;    /* out: a palette candidate existed and was turned down */
+  int l9;          /* in:  1 runs the level-9 searches (see ctx->l9) */
+  int rank;        /* in:  1 ranks the uniform modes and codes nothing */
+  w1_le_pmemo_t *pm;  /* in: predict memo shared by the runs, or NULL */
+  w1_le_smemo_t *sm;  /* in: final-stream memo shared by the finals, or NULL */
 } w1_le_pin_t;
 
 /* One VP8L bitstream (magic + dims + main). pix is the caller's ARGB. */
@@ -8274,9 +9616,12 @@ static W1_UNUSED int w1_vp8l_encode_run(const uint32_t *pix, int w, int h,
   if (!w1_le_make_ctx(bump, n, opt_parse, &ctx, &flat))
     return 1;
   ctx.uni_force = uni_force;
+  ctx.l9 = pin ? pin->l9 : level >= 9;
+  ctx.rank_only = pin ? pin->rank : 0;
   if (pin) {
     ctx.sg_force = pin->sg_force; ctx.sb_hint = pin->sb_hint;
     ctx.pal_force = pin->pal_force;
+    ctx.pm = pin->pm; ctx.sm = pin->sm;
   }
   res = (uint32_t *)w1_bump_alloc(bump, (size_t)n * 4, 4);
   if (!res) return 1;
@@ -8290,6 +9635,12 @@ static W1_UNUSED int w1_vp8l_encode_run(const uint32_t *pix, int w, int h,
   if (level >= 4) {
     ximg = (uint32_t *)w1_bump_alloc(bump, ((size_t)((w + (1 << W1_CT_SB) - 1) >> W1_CT_SB) * (size_t)((h + (1 << W1_CT_SB) - 1) >> W1_CT_SB) * 4), 4);
     if (!ximg) return 1;
+  }
+  /* Levels 0-2 use resB for the low-effort predictor duel's challenger
+   * (w1_vp8l_work_worst counts it at every level). */
+  if (level < 3) {
+    resB = (uint32_t *)w1_bump_alloc(bump, (size_t)n * 4, 4);
+    if (!resB) return 1;
   }
   if (level >= 6) {
     resB = (uint32_t *)w1_bump_alloc(bump, (size_t)n * 4, 4);
@@ -8320,17 +9671,38 @@ static W1_UNUSED int w1_vp8l_encode_run(const uint32_t *pix, int w, int h,
   return bw.err ? 3 : 0;
 }
 
+/* One level-9 portfolio run, as the pinned re-encode that repeats it. */
+typedef struct {
+  size_t len;     /* greedy-screened stream size */
+  int level, uni, sg, sb, pal;
+} w1_le_cand_t;
+#define W1_LE_MAXCAND 12
+
+static W1_UNUSED void w1_le_cand_add(w1_le_cand_t *c, int *nc, size_t len,
+                                     int level, int uni, int sg, int sb,
+                                     int pal) {
+  if (*nc >= W1_LE_MAXCAND) return;
+  c += (*nc)++;
+  c->len = len; c->level = level; c->uni = uni;
+  c->sg = sg; c->sb = sb; c->pal = pal;
+}
+
 static W1_UNUSED int w1_vp8l_encode_full(const uint32_t *pix, int w, int h,
                                          int level, int has_alpha,
-                                         uint8_t *out, size_t out_cap,
+                                         uint8_t *dst, size_t dst_cap,
                                          size_t *out_len, w1_bump_t *bump) {
   uint64_t npix = (uint64_t)(unsigned)w * (uint64_t)(unsigned)h;
   uint64_t bound = (uint64_t)8 * npix + 65536 + 256;
   size_t mark = bump->used, smark, cap, len6 = 0, len8 = 0, best_len;
-  uint8_t *tmp;
-  int rc, best_level, opt, rank[14], nrank = 0, rank8[14], nrank8 = 0;
-  w1_le_pin_t p6, p8, pg, pb, pp, pu;
-  int win_sg = -1, win_sb = -1, win_pal = 0, win_sb_alt = -1;
+  size_t out_cap;
+  uint8_t *tmp, *out;
+  int rc, best_level, opt, rank[14], nrank = 0;
+  w1_le_pin_t p6, p8, pg, pb, pp, pu, pr, fin;
+  w1_le_cand_t cand[W1_LE_MAXCAND];
+  int win_sg = -1, win_sb = -1, win_pal = 0, win_sb_alt = -1, ncand = 0;
+  int win_palf = -1;
+  w1_le_pmemo_t *pm = NULL;
+  w1_le_smemo_t *sm = NULL;
   p6.sg_force = p8.sg_force = -1;
   p6.sb_hint = p8.sb_hint = -1;
   p6.sg_used = p8.sg_used = -1;
@@ -8338,39 +9710,83 @@ static W1_UNUSED int w1_vp8l_encode_full(const uint32_t *pix, int w, int h,
   p6.pal_seen = p8.pal_seen = 0;
   p6.sb_used = p8.sb_used = -1;
   p6.sb_alt = p8.sb_alt = -1;
+  p6.l9 = p8.l9 = pg.l9 = pb.l9 = pp.l9 = pu.l9 = pr.l9 = fin.l9 = 1;
+  p6.rank = p8.rank = pg.rank = pb.rank = pp.rank = pu.rank = fin.rank = 0;
+  pr.rank = 1;
   if (level < 0) level = 0;
   if (level > 9) level = 9;
   if (level < 9) {
-    rc = w1_vp8l_encode_run(pix, w, h, level, has_alpha, 0, out,
-                            out_cap, out_len, bump, -1, NULL, NULL, NULL);
+    rc = w1_vp8l_encode_run(pix, w, h, level, has_alpha, 0, dst,
+                            dst_cap, out_len, bump, -1, NULL, NULL, NULL);
     bump->used = mark;
     return rc;
   }
+  /* Every portfolio run below screens with the greedy parse; the optimal
+   * parse (linear, but ~20 full-image passes per run) is spent once, on a
+   * pinned re-encode of the winner at the end. */
   opt = level >= W1_LZ_OPT_LEVEL;
   if (bound > (uint64_t)(size_t)-1) return 2;
-  cap = out_cap < (size_t)bound ? out_cap : (size_t)bound;
-  tmp = (uint8_t *)w1_bump_alloc(bump, cap ? cap : 1, 1);
-  if (!tmp)
-    return w1_vp8l_encode_run(pix, w, h, level, has_alpha, opt, out,
-                              out_cap, out_len, bump, -1, NULL, NULL,
+  /* The runs write to out and the winner is parked in tmp, both sized to
+   * the stream bound rather than to dst: greedy-screened runs are larger
+   * than the finished winner, so a dst sized exactly to the final stream
+   * must not make them fail. */
+  cap = out_cap = (size_t)bound;
+  tmp = (uint8_t *)w1_bump_alloc(bump, cap, 1);
+  out = (uint8_t *)w1_bump_alloc(bump, cap, 1);
+  if (!tmp || !out) {
+    bump->used = mark;
+    return w1_vp8l_encode_run(pix, w, h, level, has_alpha, opt, dst,
+                              dst_cap, out_len, bump, -1, NULL, NULL,
                               NULL);
+  }
   smark = bump->used;
-  rc = w1_vp8l_encode_run(pix, w, h, 6, has_alpha, opt, out, out_cap,
-                          &len6, bump, -1, rank, &nrank, &p6);
+  pm = (w1_le_pmemo_t *)w1_bump_alloc(bump, sizeof *pm, 8);
+  if (pm) {
+    int i;
+    pm->n = 0;
+    pm->cap = (size_t)((w + 7) >> 3) * (size_t)((h + 7) >> 3);
+    pm->s[0].modes = (uint8_t *)w1_bump_alloc(bump, pm->cap * W1_LE_PM_SLOTS, 1);
+    if (!pm->s[0].modes) { pm = NULL; bump->used = smark; }
+    else
+      for (i = 1; i < W1_LE_PM_SLOTS; i++)
+        pm->s[i].modes = pm->s[0].modes + (size_t)i * pm->cap;
+  }
+  p6.pm = p8.pm = pg.pm = pb.pm = pp.pm = pu.pm = pr.pm = fin.pm = pm;
+  {
+    size_t sm_mark = bump->used, scap = (size_t)(npix / 8) + 64;
+    int i;
+    sm = (w1_le_smemo_t *)w1_bump_alloc(bump, sizeof *sm, 8);
+    for (i = 0; sm && i < W1_LE_SM_SLOTS; i++) {
+      sm->s[i].bits = (uint8_t *)w1_bump_alloc(bump, scap + 2, 1);
+      sm->s[i].lens = (uint8_t *)w1_bump_alloc(bump, W1_LE_NC, 1);
+      sm->s[i].counts = (int *)w1_bump_alloc(bump, W1_LE_NC * sizeof(int), 4);
+      sm->s[i].codes = (int *)w1_bump_alloc(bump, W1_LE_NC * sizeof(int), 4);
+      if (!sm->s[i].bits || !sm->s[i].lens || !sm->s[i].counts ||
+          !sm->s[i].codes) {
+        sm = NULL; bump->used = sm_mark;
+      }
+    }
+    if (sm) { sm->n = 0; sm->cap = scap; }
+  }
+  p6.sm = p8.sm = pg.sm = pb.sm = pp.sm = pu.sm = pr.sm = fin.sm = sm;
+  smark = bump->used;
+  rc = w1_vp8l_encode_run(pix, w, h, 6, has_alpha, 0, out, out_cap,
+                          &len6, bump, -1, NULL, NULL, &p6);
   if (rc != 0) { bump->used = mark; return rc; }
   *out_len = len6;
   best_len = len6; best_level = 6;
+  w1_le_cand_add(cand, &ncand, len6, 6, -1, p6.sg_used, p6.sb_used, -1);
   if (w1_le_uniform(pix, (int)npix) ||
       (w1_le_hopeless(pix, w, h) &&
        w1_le_alpha_uniform(pix, (int)npix))) {
-    bump->used = mark;
-    return 0;
-  }
-  if (len6 <= cap) {
+    if (len6 <= cap) memcpy(tmp, out, len6);
+  } else if (len6 <= cap) {
     memcpy(tmp, out, len6);           /* keep the level-6 payload */
     bump->used = smark;               /* reuse its scratch for level 8 */
-    rc = w1_vp8l_encode_run(pix, w, h, 8, has_alpha, opt, out, out_cap,
-                            &len8, bump, -1, rank8, &nrank8, &p8);
+    rc = w1_vp8l_encode_run(pix, w, h, 8, has_alpha, 0, out, out_cap,
+                            &len8, bump, -1, NULL, NULL, &p8);
+    if (rc == 0)
+      w1_le_cand_add(cand, &ncand, len8, 8, -1, p8.sg_used, p8.sb_used, -1);
     if (rc != 0 || len8 >= len6) {    /* level 8 lost (or failed): restore */
       memcpy(out, tmp, len6);
       *out_len = len6;
@@ -8378,7 +9794,6 @@ static W1_UNUSED int w1_vp8l_encode_full(const uint32_t *pix, int w, int h,
     } else {
       *out_len = len8; best_len = len8; best_level = 8;
       memcpy(tmp, out, len8);
-      if (nrank8) { memcpy(rank, rank8, sizeof(rank)); nrank = nrank8; }
       p6 = p8;
     }
     /* What the current winner (the level-6 or level-8 run) did, so a
@@ -8401,17 +9816,18 @@ static W1_UNUSED int w1_vp8l_encode_full(const uint32_t *pix, int w, int h,
      * ranks tile size on the pre-green image. */
     if (p6.sg_used >= 0 && best_len <= cap) {
       size_t leng = 0;
-      int rankg[14], nrankg = 0;
       pg.sg_force = p6.sg_used ? 0 : 1;
       pg.sb_hint = p6.sb_used;
       pg.sg_used = pg.sb_used = -1;
       pg.pal_force = -1; pg.pal_seen = 0;
       bump->used = smark;
-      rc = w1_vp8l_encode_run(pix, w, h, best_level, has_alpha, opt, out,
-                              out_cap, &leng, bump, -1, rankg, &nrankg, &pg);
+      rc = w1_vp8l_encode_run(pix, w, h, best_level, has_alpha, 0, out,
+                              out_cap, &leng, bump, -1, NULL, NULL, &pg);
+      if (rc == 0)
+        w1_le_cand_add(cand, &ncand, leng, best_level, -1, pg.sg_force,
+                       pg.sb_used, -1);
       if (rc == 0 && leng < best_len && leng <= cap) {
         best_len = leng; memcpy(tmp, out, leng);
-        if (nrankg) { memcpy(rank, rankg, sizeof(rank)); nrank = nrankg; }
         win_sg = pg.sg_force; win_sb = pg.sb_used; win_pal = pg.pal_seen;
       }
       memcpy(out, tmp, best_len);
@@ -8432,16 +9848,17 @@ static W1_UNUSED int w1_vp8l_encode_full(const uint32_t *pix, int w, int h,
      * disagree, and it repeats no green search. */
     if (win_sb_alt >= 0 && win_sb_alt != win_sb && best_len <= cap) {
       size_t lenb = 0;
-      int rankb[14], nrankb = 0;
       pb.sg_force = win_sg; pb.sb_hint = win_sb_alt;
       pb.sg_used = pb.sb_used = -1; pb.sb_alt = -1;
       pb.pal_force = -1; pb.pal_seen = 0;
       bump->used = smark;
-      rc = w1_vp8l_encode_run(pix, w, h, best_level, has_alpha, opt, out,
-                              out_cap, &lenb, bump, -1, rankb, &nrankb, &pb);
+      rc = w1_vp8l_encode_run(pix, w, h, best_level, has_alpha, 0, out,
+                              out_cap, &lenb, bump, -1, NULL, NULL, &pb);
+      if (rc == 0)
+        w1_le_cand_add(cand, &ncand, lenb, best_level, -1, win_sg,
+                       win_sb_alt, -1);
       if (rc == 0 && lenb < best_len && lenb <= cap) {
         best_len = lenb; memcpy(tmp, out, lenb);
-        if (nrankb) { memcpy(rank, rankb, sizeof(rank)); nrank = nrankb; }
         win_sb = win_sb_alt; win_pal = pb.pal_seen;
       }
       memcpy(out, tmp, best_len);
@@ -8461,7 +9878,6 @@ static W1_UNUSED int w1_vp8l_encode_full(const uint32_t *pix, int w, int h,
      * and it only runs for images with at most 256 distinct colours. */
     if (win_pal && best_len <= cap) {
       size_t lenp = 0;
-      int rankp[14], nrankp = 0;
       /* The palette stream is built from the original pixels, so the
        * green branch cannot change it; pinning the branch the winner
        * took just stops this run re-deciding it, and the non-palette
@@ -8470,11 +9886,13 @@ static W1_UNUSED int w1_vp8l_encode_full(const uint32_t *pix, int w, int h,
       pp.sg_used = pp.sb_used = -1;
       pp.pal_force = 1; pp.pal_seen = 0;
       bump->used = smark;
-      rc = w1_vp8l_encode_run(pix, w, h, best_level, has_alpha, opt, out,
-                              out_cap, &lenp, bump, -1, rankp, &nrankp, &pp);
+      rc = w1_vp8l_encode_run(pix, w, h, best_level, has_alpha, 0, out,
+                              out_cap, &lenp, bump, -1, NULL, NULL, &pp);
+      if (rc == 0)
+        w1_le_cand_add(cand, &ncand, lenp, best_level, -1, win_sg, win_sb, 1);
       if (rc == 0 && lenp < best_len && lenp <= cap) {
         best_len = lenp; memcpy(tmp, out, lenp);
-        if (nrankp) { memcpy(rank, rankp, sizeof(rank)); nrank = nrankp; }
+        win_palf = 1;
       }
       memcpy(out, tmp, best_len);
       *out_len = best_len;
@@ -8488,8 +9906,22 @@ static W1_UNUSED int w1_vp8l_encode_full(const uint32_t *pix, int w, int h,
      * palette duel nor the plain portfolio finds the winner, because it is
      * the combination (2180 -> 2158) that wins. The extra pass only runs
      * for images with at most 256 distinct colours. */
-    if (npix <= (uint64_t)W1_LE_UNI_PORTFOLIO_MAXN && best_len <= cap) {
+    if (best_len <= cap) {
       int i, pf;
+      /* The ranking comes from one rank-only run pinned to the winner (its
+       * green branch, tile size and palette), which stops once the
+       * predictor branches have ranked the modes: ranking inside every
+       * portfolio run cost more than the portfolio itself at 1280x1040. */
+      pr.sg_force = win_sg; pr.sb_hint = win_sb; pr.pal_force = win_palf;
+      pr.sg_used = pr.sb_used = pr.sb_alt = -1; pr.pal_seen = 0;
+      bump->used = smark;
+      {
+        size_t lenr = 0;
+        if (w1_vp8l_encode_run(pix, w, h, best_level, has_alpha, 0, out,
+                               out_cap, &lenr, bump, -1, rank, &nrank,
+                               &pr) != 0)
+          nrank = 0;
+      }
       for (pf = 0; pf < (win_pal ? 2 : 1); pf++) {
         pu.sg_force = pf ? win_sg : -1; pu.sb_hint = pf ? win_sb : -1;
         pu.sg_used = pu.sb_used = -1;
@@ -8497,9 +9929,12 @@ static W1_UNUSED int w1_vp8l_encode_full(const uint32_t *pix, int w, int h,
         for (i = 0; i < nrank && i < W1_LE_UNI_PORTFOLIO_K; i++) {
           size_t lenu = 0;
           bump->used = smark;
-          rc = w1_vp8l_encode_run(pix, w, h, best_level, has_alpha, opt, out,
+          rc = w1_vp8l_encode_run(pix, w, h, best_level, has_alpha, 0, out,
                                   out_cap, &lenu, bump, rank[i], NULL, NULL,
                                   &pu);
+          if (rc == 0)
+            w1_le_cand_add(cand, &ncand, lenu, best_level, rank[i],
+                           pu.sg_force, pu.sb_hint, pu.pal_force);
           if (rc == 0 && lenu < best_len && lenu <= cap) {
             best_len = lenu; memcpy(tmp, out, lenu);
           }
@@ -8509,6 +9944,48 @@ static W1_UNUSED int w1_vp8l_encode_full(const uint32_t *pix, int w, int h,
       *out_len = best_len;
       rc = 0;
     }
+  }
+  /* Finish under the optimal parse: re-encode the best-screened runs with
+   * their pins (green branch, tile size, palette, uniform mode) and the DP
+   * on, leaving cache, groups and stream shape to be re-decided on DP
+   * costs. Screen sizes are greedy and the DP's gain differs by run, so
+   * near-tied runs are all finished. A finish is kept only when strictly
+   * smaller, so the DP can never grow a file. */
+  if (opt && best_len <= cap && ncand) {
+    int i, j, nfin = 0;
+    for (i = 1; i < ncand; i++)          /* stable sort by screened size */
+      for (j = i; j > 0 && cand[j - 1].len > cand[j].len; j--) {
+        w1_le_cand_t t = cand[j]; cand[j] = cand[j - 1]; cand[j - 1] = t;
+      }
+    for (i = 0; i < ncand && nfin < W1_LZ_OPT_FINALISTS; i++) {
+      size_t leno = 0;
+      if (i && (uint64_t)cand[i].len * 1024 >
+                   (uint64_t)cand[0].len * (1024 + W1_LZ_OPT_MARGIN))
+        break;
+      for (j = 0; j < i; j++)            /* duplicate pins: same stream */
+        if (cand[j].level == cand[i].level && cand[j].uni == cand[i].uni &&
+            cand[j].sg == cand[i].sg && cand[j].sb == cand[i].sb &&
+            cand[j].pal == cand[i].pal) break;
+      if (j < i) continue;
+      nfin++;
+      fin.sg_force = cand[i].sg; fin.sb_hint = cand[i].sb;
+      fin.pal_force = cand[i].pal;
+      fin.sg_used = fin.sb_used = fin.sb_alt = -1; fin.pal_seen = 0;
+      bump->used = smark;
+      rc = w1_vp8l_encode_run(pix, w, h, cand[i].level, has_alpha, 1, out,
+                              out_cap, &leno, bump, cand[i].uni, NULL, NULL,
+                              &fin);
+      if (rc == 0 && leno < best_len && leno <= cap) {
+        best_len = leno; memcpy(tmp, out, leno);
+      }
+    }
+    memcpy(out, tmp, best_len);
+    *out_len = best_len;
+    rc = 0;
+  }
+  if (rc == 0) {
+    if (*out_len > dst_cap) rc = 3;
+    else memcpy(dst, out, *out_len);
   }
   bump->used = mark;
   return rc;
@@ -8560,9 +10037,10 @@ static W1_UNUSED int w1_alph_encode(const uint8_t *alpha, int w, int h,
   uint32_t *res32 = NULL, *predres = NULL, *modepix = NULL, *ximg = NULL;
   uint32_t *resB = NULL, *svximg = NULL;
   uint8_t *svmodes = NULL;
+  w1_le_ctx_t initial_ctx;
   w1_bw_t bw;
   size_t vlen;
-  int tw, th, i;
+  int tw, th, i, colors = 0;
   if (w < 1 || h < 1 || w > WEBP1_MAX_DIM || h > WEBP1_MAX_DIM) return 2;
   if (!alpha || !out || !out_len) return 2;
   if (level < 0) level = 0;
@@ -8572,16 +10050,22 @@ static W1_UNUSED int w1_alph_encode(const uint8_t *alpha, int w, int h,
   deltas = (uint8_t *)w1_bump_alloc(bump, (size_t)n, 1);
   pix = (uint32_t *)w1_bump_alloc(bump, (size_t)n * 4, 4);
   if (!deltas || !pix) return 1;
-  /* Pick filter by L1 of deltas (cheap proxy for size). */
   {
     uint8_t *rowbuf = (uint8_t *)w1_bump_alloc(bump, (size_t)w, 1);
+    uint8_t seen[256] = {0};
     if (!rowbuf) return 1;
     for (f = 0; f < 4; f++) {
       uint64_t t = 0;
       for (y = 0; y < h; y++) {
         const uint8_t *row = alpha + (size_t)y * (size_t)w;
         w1_alph_filter(f, y ? row - w : NULL, row, rowbuf, w);
-        for (i = 0; i < w; i++) t += (uint64_t)(unsigned)w1_le_sabs(rowbuf[i]);
+        for (i = 0; i < w; i++) {
+          t += (uint64_t)(unsigned)w1_le_sabs(rowbuf[i]);
+          if (f == 0 && colors <= 16 && !seen[row[i]]) {
+            seen[row[i]] = 1;
+            colors++;
+          }
+        }
       }
       if (t < best_l1) { best_l1 = t; best_f = f; }
     }
@@ -8594,6 +10078,7 @@ static W1_UNUSED int w1_alph_encode(const uint8_t *alpha, int w, int h,
   tw = (w + 7) >> 3; th = (h + 7) >> 3;
   if (!w1_le_make_ctx(bump, n, level >= 9, &ctx, &flat))
     return 1;
+  ctx.l9 = level >= 9;
   res32 = (uint32_t *)w1_bump_alloc(bump, (size_t)n * 4, 4);
   if (!res32) return 1;
   {
@@ -8606,6 +10091,12 @@ static W1_UNUSED int w1_alph_encode(const uint8_t *alpha, int w, int h,
     ximg = (uint32_t *)w1_bump_alloc(bump, ((size_t)((w + (1 << W1_CT_SB) - 1) >> W1_CT_SB) * (size_t)((h + (1 << W1_CT_SB) - 1) >> W1_CT_SB) * 4), 4);
     if (!ximg) return 1;
   }
+  /* Levels 0-2 use resB for the low-effort predictor duel's challenger
+   * (w1_vp8l_work_worst counts it at every level). */
+  if (level < 3) {
+    resB = (uint32_t *)w1_bump_alloc(bump, (size_t)n * 4, 4);
+    if (!resB) return 1;
+  }
   if (level >= 6) {
     resB = (uint32_t *)w1_bump_alloc(bump, (size_t)n * 4, 4);
     svmodes = (uint8_t *)w1_bump_alloc(bump, (size_t)tw * (size_t)th, 1);
@@ -8614,11 +10105,30 @@ static W1_UNUSED int w1_alph_encode(const uint8_t *alpha, int w, int h,
         !svximg) return 1;
   }
   out[0] = 0;   /* overwritten below */
+  initial_ctx = ctx;
   w1_bw_init(&bw, out + 1, out_cap - 1);
   /* No magic/dims/version: ALPH embeds only the VP8L main stream. */
   w1_le_main(&ctx, pix, res32, predres, resB, svmodes, svximg, w, h,
                level, flat, modes, modepix, ximg, &bw);
   vlen = w1_bw_flush(&bw, out + 1);
+  if (!bw.err && vlen <= (size_t)n && best_f != 0 &&
+      level >= 9 && colors <= 16) {
+    size_t alt_len;
+    memcpy(deltas, out + 1, vlen);
+    for (i = 0; i < n; i++) pix[i] = (uint32_t)alpha[i] << 8;
+    ctx = initial_ctx;
+    w1_bw_init(&bw, out + 1, out_cap - 1);
+    w1_le_main(&ctx, pix, res32, predres, resB, svmodes, svximg, w, h,
+               level, flat, modes, modepix, ximg, &bw);
+    alt_len = w1_bw_flush(&bw, out + 1);
+    if (!bw.err && alt_len < vlen) {
+      out[0] = 1;
+      *out_len = alt_len + 1;
+      return 0;
+    }
+    memcpy(out + 1, deltas, vlen);
+    bw.err = 0;
+  }
   if (!bw.err && vlen + 1 <= (size_t)n + 1) {
     out[0] = (uint8_t)(1 | (best_f << 2));
     *out_len = vlen + 1;
@@ -8626,8 +10136,8 @@ static W1_UNUSED int w1_alph_encode(const uint8_t *alpha, int w, int h,
   }
   /* Raw fallback (also used when VP8L didn't fit). */
   if ((size_t)n + 1 > out_cap) return 3;
-  out[0] = (uint8_t)(0 | (best_f << 2));
-  for (i = 0; i < n; i++) out[1 + i] = deltas[i];
+  out[0] = 0;
+  memcpy(out + 1, alpha, (size_t)n);
   *out_len = (size_t)n + 1;
   return 0;
 }
@@ -9621,12 +11131,32 @@ static W1_UNUSED void w1_vp8e_rdoq(int16_t *lev, const int16_t *coef,
     }
     return;
   }
-  for (i = (skip_dc ? 1 : 0); i < 16; i++) {
-    int L = lev[i], a, sgn, dq, t, delta;
-    if (L == 0) continue;
-    dq = i ? dq_ac : dq_dc;
-    sgn = L < 0 ? -1 : 1;
-    a = sgn * L;
+  {
+  /* Visit only the nonzero levels (bit i of nz), lowest first. */
+  static const uint8_t debruijn[32] = {
+    0, 1, 28, 2, 29, 14, 24, 3, 30, 22, 20, 15, 25, 17, 4, 8,
+    31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18, 6, 11, 5, 10, 9};
+  unsigned nz;
+#ifdef W1_USE_SSE2
+  {
+    const __m128i z = _mm_setzero_si128();
+    const __m128i e = _mm_packs_epi16(
+        _mm_cmpeq_epi16(_mm_loadu_si128((const __m128i *)(const void *)lev), z),
+        _mm_cmpeq_epi16(_mm_loadu_si128((const __m128i *)(const void *)(lev + 8)), z));
+    nz = ~(unsigned)_mm_movemask_epi8(e) & 0xffffu;
+  }
+#else
+  nz = 0;
+  for (i = 0; i < 16; i++) nz |= (unsigned)(lev[i] != 0) << i;
+#endif
+  if (skip_dc) nz &= ~1u;
+  while (nz) {
+    /* m is L's sign mask, (x ^ m) - m = sgn*x. */
+    const int i = debruijn[((nz & (0u - nz)) * 0x077CB531u) >> 27];
+    const int L = lev[i], m = L >> 31, a = (L ^ m) - m;
+    const int dq = i ? dq_ac : dq_dc;
+    int t, delta, upd;
+    nz &= nz - 1;
     /* Keep L-sgn iff 8*(d1^2 - d0^2) < (cbits(a) - cbits(a-1)) * elam,
      * with d0 = c - L*dq and d1 = d0 + sgn*dq.  The left side is the
      * exact difference of the two candidates' distortions, so the test
@@ -9634,11 +11164,12 @@ static W1_UNUSED void w1_vp8e_rdoq(int16_t *lev, const int16_t *coef,
      * d1^2 - d0^2 = 2*t*dq + dq^2.  dq > 0 on every call, and the
      * rate difference is zero unless a is one of the few magnitudes
      * where cbits8 steps, so the common case is one add and a compare. */
-    t = sgn * coef[i] - a * dq;
+    t = ((coef[i] ^ m) - m) - a * dq;
     delta = (a <= 66) ? (int)w1k_vp8e_cbits8d[a]
                       : ((((a - 67) & (a - 68)) == 0) ? 8 : 0);
-    if ((int64_t)(8 * dq) * (2 * t + dq) < (int64_t)delta * elam)
-      lev[i] = (int16_t)(L - sgn);
+    upd = (int64_t)(8 * dq) * (2 * t + dq) < (int64_t)delta * elam;
+    lev[i] = (int16_t)(L - ((m | 1) & -upd));
+  }
   }
 }
 
@@ -9896,6 +11427,105 @@ static W1_UNUSED int w1_vp8e_block_cost(int type,
   return bits;
 }
 
+/* block_cost as table lookups: per (type, band, ctx) row of W1_LC_W
+ * entries, [a] (1..67) = the whole token from the ZERO node on (tree bits,
+ * sign, category extra bits; for a >= 67 without the 11 cat6 extra bits),
+ * [W1_LC_Z] = a zero token, [W1_LC_E0]/[W1_LC_E1] = EOB / not-EOB. Sums
+ * the same integer terms as w1_vp8e_block_cost, so costs are identical. */
+#define W1_LC_W 72
+#define W1_LC_Z 68
+#define W1_LC_E0 69
+#define W1_LC_E1 70
+static W1_UNUSED void w1_vp8e_lc_fill(uint16_t *lc, const uint8_t *probs) {
+  /* Category extra bits use fixed probs: price them once per fill; each
+   * row then needs its 11 node costs and six category prefixes. */
+  static const uint8_t base[6] = {5, 7, 11, 19, 35, 67};
+  uint16_t xtra[68];
+  uint8_t cat_of[68];
+  int i, a, cat = 0;
+  for (a = 5; a <= 67; a++) {
+    int j, n, b = 0;
+    while (cat < 5 && a >= base[cat + 1]) cat++;
+    cat_of[a] = (uint8_t)cat;
+    if (cat < 5) {
+      n = w1k_vp8_pcat_nbits[cat];
+      for (j = 0; j < n; j++)
+        b += w1_vp8e_bit_cost(((a - base[cat]) >> (n - 1 - j)) & 1,
+                              w1k_vp8_pcat_ptr[cat][j]);
+    }
+    xtra[a] = (uint16_t)b;
+  }
+  for (i = 0; i < 96; i++) {
+    const uint8_t *p = probs + (size_t)i * 11;
+    uint16_t *r = lc + (size_t)i * W1_LC_W;
+    int c0[11], c1[11], pre[6], n, two, hi;
+    for (n = 0; n < 11; n++) {
+      c0[n] = w1_vp8e_bit_cost(0, p[n]);
+      c1[n] = w1_vp8e_bit_cost(1, p[n]);
+    }
+    r[0] = 0;
+    r[W1_LC_Z] = (uint16_t)c0[W1_N_ZERO];
+    r[W1_LC_E0] = (uint16_t)c0[W1_N_EOB];
+    r[W1_LC_E1] = (uint16_t)c1[W1_N_EOB];
+    r[71] = 0;
+    r[1] = (uint16_t)(c1[W1_N_ZERO] + 8 + c0[W1_N_ONE]);
+    two = c1[W1_N_ZERO] + 8 + c1[W1_N_ONE];
+    r[2] = (uint16_t)(two + c0[W1_N_LOW] + c0[W1_N_TWO]);
+    r[3] = (uint16_t)(two + c0[W1_N_LOW] + c1[W1_N_TWO] + c0[W1_N_THREE]);
+    r[4] = (uint16_t)(two + c0[W1_N_LOW] + c1[W1_N_TWO] + c1[W1_N_THREE]);
+    hi = two + c1[W1_N_LOW];
+    pre[0] = hi + c0[W1_N_HIGHLOW] + c0[W1_N_CATONE];
+    pre[1] = hi + c0[W1_N_HIGHLOW] + c1[W1_N_CATONE];
+    pre[2] = hi + c1[W1_N_HIGHLOW] + c0[W1_N_CAT34] + c0[W1_N_CAT3];
+    pre[3] = hi + c1[W1_N_HIGHLOW] + c0[W1_N_CAT34] + c1[W1_N_CAT3];
+    pre[4] = hi + c1[W1_N_HIGHLOW] + c1[W1_N_CAT34] + c0[W1_N_CAT5];
+    pre[5] = hi + c1[W1_N_HIGHLOW] + c1[W1_N_CAT34] + c1[W1_N_CAT5];
+    for (a = 5; a <= 67; a++) r[a] = (uint16_t)(pre[cat_of[a]] + xtra[a]);
+  }
+}
+static W1_UNUSED int w1_vp8e_block_cost_lc(int type, uint8_t *left,
+                                           uint8_t *above, int li, int ai,
+                                           const int16_t *lev,
+                                           const uint16_t *lc) {
+  const int start = (type == 0) ? 1 : 0;
+  const uint16_t *rt = lc + (size_t)type * 24 * W1_LC_W;
+  int c = start, t = left[li] + above[ai], bits, last;
+  for (last = 15; last >= start; last--)
+    if (lev[w1k_vp8_zigzag[last]] != 0) break;
+  if (last < start) {
+    left[li] = above[ai] = 0;
+    return rt[(w1k_vp8_bands[c] * 3 + t) * W1_LC_W + W1_LC_E0];
+  }
+  bits = 0;
+  for (;;) {
+    const uint16_t *r = rt + (w1k_vp8_bands[c] * 3 + t) * W1_LC_W;
+    int v, a;
+    bits += r[W1_LC_E1];
+    while ((v = lev[w1k_vp8_zigzag[c]]) == 0) {
+      bits += r[W1_LC_Z];
+      c++;
+      t = 0;
+      r = rt + w1k_vp8_bands[c] * 3 * W1_LC_W;
+    }
+    a = v < 0 ? -v : v;
+    if (a < 67) bits += r[a];
+    else {
+      int j, extra = a - 67;
+      bits += r[67];
+      for (j = 0; j < 11; j++)
+        bits += w1_vp8e_bit_cost((extra >> (10 - j)) & 1, w1k_vp8_pcat_ptr[5][j]);
+    }
+    t = a == 1 ? 1 : 2;
+    if (c == last) {
+      if (c < 15) bits += rt[(w1k_vp8_bands[c + 1] * 3 + t) * W1_LC_W + W1_LC_E0];
+      break;
+    }
+    c++;
+  }
+  left[li] = above[ai] = 1;
+  return bits;
+}
+
 /* Any nonzero level from `skip_dc` on: the value written into the token
  * left/above context maps, exactly like w1_vp8e_write_block's final flag. */
 static W1_UNUSED int w1_vp8e_lev_any(const int16_t *lev, int skip_dc) {
@@ -10099,8 +11729,12 @@ typedef struct {
   int max_lev;                 /* level clamp so |level*dq| fits int16 */
   int rdoq_on;                 /* RDOQ mode: 1 = full, 2 = |1|-only, 0 = off */
   int polish_on;               /* run the trellis polish on winner MBs */
+  int uv_flat;                 /* chroma mode pick on plain SSE (effort 9) */
+  uint64_t b_sse;              /* luma SSE of the last complete b_try */
   const uint8_t *tc_probs;     /* probs the c0/c1 token-cost tables mirror */
   int16_t *tc0, *tc1;          /* per-token-node bit costs (x8), bit 0/1 */
+  const uint8_t *lc_probs;     /* probs the lc whole-token table mirrors */
+  uint16_t *lc;                /* w1_vp8e_lc_fill table (96 x W1_LC_W) */
 } w1_vp8e_t;
 
 /* Per-node bit costs for the token trees under `probs`: the trellis needs
@@ -10113,6 +11747,13 @@ static W1_UNUSED void w1_vp8e_tokcost_fill(int16_t *c0, int16_t *c1,
     c0[i] = (int16_t)w1_vp8e_bit_cost(0, probs[i]);
     c1[i] = (int16_t)w1_vp8e_bit_cost(1, probs[i]);
   }
+}
+static W1_UNUSED const uint16_t *w1_vp8e_lc_ensure(w1_vp8e_t *en) {
+  if (en->lc_probs != en->rd_probs) {
+    w1_vp8e_lc_fill(en->lc, en->rd_probs);
+    en->lc_probs = en->rd_probs;
+  }
+  return en->lc;
 }
 static W1_UNUSED void w1_vp8e_tc_ensure(w1_vp8e_t *en) {
   const uint8_t *p = en->rd_probs ? en->rd_probs : w1k_vp8_coef_dflt;
@@ -10363,7 +12004,7 @@ static W1_UNUSED uint64_t w1_vp8e_luma_try(w1_vp8e_t *en, int mbx, int mby,
   w1_vp8e_rdoq(lev[24], y2, en->dq[4], en->dq[5], 0, en->lam, en->rdoq_on);
   w1_vp8e_dequant(lev[24], en->dq[4], en->dq[5], y2dq);
   w1_vp8_wht(y2dq, recdc);
-  if (en->rd_probs) bits += w1_vp8e_block_cost(1, lf, ab, 8, 8, lev[24], en->rd_probs);
+  if (en->rd_probs) bits += w1_vp8e_block_cost_lc(1, lf, ab, 8, 8, lev[24], w1_vp8e_lc_ensure(en));
   /* reconstruct + distortion + rate */
   for (k = 0; k < 16; k++) {
     const int bx = (k & 3) * 4, by = (k >> 2) * 4;
@@ -10373,8 +12014,10 @@ static W1_UNUSED uint64_t w1_vp8e_luma_try(w1_vp8e_t *en, int mbx, int mby,
     dq[0] = recdc[k];
     w1_vp8_block_residue(dp, ys, dq);
     sse += (int64_t)w1_vp8e_sse4(op + by * ys + bx, ys, dp, ys);
-    bits += en->rd_probs ? w1_vp8e_block_cost(0, lf, ab,
-      w1k_vp8_ctx_left[k], w1k_vp8_ctx_above[k], lev[k], en->rd_probs)
+    if ((uint64_t)sse * 8 + (uint64_t)bits * (uint64_t)en->lam >= limit)
+      return limit;                 /* the block's bits only add */
+    bits += en->rd_probs ? w1_vp8e_block_cost_lc(0, lf, ab,
+      w1k_vp8_ctx_left[k], w1k_vp8_ctx_above[k], lev[k], w1_vp8e_lc_ensure(en))
       : w1_vp8e_block_bits8(lev[k], 1);
     if ((uint64_t)sse * 8 + (uint64_t)bits * (uint64_t)en->lam >= limit)
       return limit;
@@ -10459,9 +12102,11 @@ static W1_UNUSED uint64_t w1_vp8e_b_try(w1_vp8e_t *en, int mbx, int mby,
         w1_vp8_block_residue(rc, 4, dq);
         s = w1_vp8e_sse4(sp, ys, rc, 4);
       }
+      /* bb >= 0: a mode already beaten on SSE + mode bits cannot win. */
+      if (s * 8 + (uint64_t)c8 * (uint64_t)en->lam >= bestc) continue;
       if (en->rd_probs) {
         uint8_t lf0 = tl[w1k_vp8_ctx_left[bi]], ab0 = ta[w1k_vp8_ctx_above[bi]];
-        bb = w1_vp8e_block_cost(3, &lf0, &ab0, 0, 0, qlev, en->rd_probs);
+        bb = w1_vp8e_block_cost_lc(3, &lf0, &ab0, 0, 0, qlev, w1_vp8e_lc_ensure(en));
       } else bb = w1_vp8e_block_bits8(qlev, 0);
       {
         uint64_t c = s * 8 + (uint64_t)(bb + c8) * (uint64_t)en->lam;
@@ -10472,8 +12117,8 @@ static W1_UNUSED uint64_t w1_vp8e_b_try(w1_vp8e_t *en, int mbx, int mby,
         }
       }
     }
-    if (en->rd_probs) (void)w1_vp8e_block_cost(3, tl, ta,
-      w1k_vp8_ctx_left[bi], w1k_vp8_ctx_above[bi], bestlev, en->rd_probs);
+    if (en->rd_probs) (void)w1_vp8e_block_cost_lc(3, tl, ta,
+      w1k_vp8_ctx_left[bi], w1k_vp8_ctx_above[bi], bestlev, w1_vp8e_lc_ensure(en));
     bmodes[bi] = (uint8_t)bestm;
     memcpy(lev[bi], bestlev, sizeof(bestlev));
     for (r = 0; r < 4; r++) memcpy(dp + r * ys, bestrc + r * 4, 4);
@@ -10481,6 +12126,7 @@ static W1_UNUSED uint64_t w1_vp8e_b_try(w1_vp8e_t *en, int mbx, int mby,
     bits += bestb;
     if (sse * 8 + (uint64_t)bits * (uint64_t)en->lam >= limit) return limit;
   }
+  en->b_sse = sse;
   return sse * 8 + (uint64_t)bits * (uint64_t)en->lam;
 }
 
@@ -10508,6 +12154,66 @@ static W1_UNUSED void w1_vp8e_write_bmodes(w1_benc_t *e, w1_vp8d_t *b, int col,
 }
 
 /* Try one chroma mode; lev slots 16..23. */
+/* Chroma distortion as the decoded RGB sees it. The decoder's 9-3-3-1
+ * fancy upsampler spreads each chroma error over up to 16 pixels: for an
+ * error field e on the chroma grid the upsampled energy is e'(A (x) A)e,
+ * A tridiagonal with 20/16 on and 6/16 off the diagonal - 4x per sample
+ * for a flat error, 1.56x for a white one. Returns that form over one 8x8
+ * MB plane in 1/256 units (the truncated operator keeps its eigenvalues
+ * >= 8/16 per axis, so the result is >= 64 * SSE). */
+static W1_UNUSED int64_t w1_vp8e_uv_wdist(const uint8_t *s, const uint8_t *d,
+                                          int st) {
+#ifdef W1_USE_SSE2
+  /* g = 20*sum(e.t) + 6*sum(e[y].t[y-1] + e[y-1].t[y]); |t| <= 8160 fits
+   * int16 and every madd lane sum stays under 2^31 (<= 233M), so this is
+   * the scalar form's exact value. */
+  const __m128i zero = _mm_setzero_si128();
+  const __m128i k20 = _mm_set1_epi16(20), k6 = _mm_set1_epi16(6);
+  __m128i A = zero, C = zero, ep = zero, tp = zero;
+  int y;
+  for (y = 0; y < 8; y++) {
+    const __m128i sv = _mm_unpacklo_epi8(
+        _mm_loadl_epi64((const __m128i *)(const void *)(s + y * st)), zero);
+    const __m128i dv = _mm_unpacklo_epi8(
+        _mm_loadl_epi64((const __m128i *)(const void *)(d + y * st)), zero);
+    const __m128i e = _mm_sub_epi16(dv, sv);
+    const __m128i t = _mm_add_epi16(_mm_mullo_epi16(e, k20),
+        _mm_mullo_epi16(_mm_add_epi16(_mm_slli_si128(e, 2),
+                                      _mm_srli_si128(e, 2)), k6));
+    A = _mm_add_epi32(A, _mm_madd_epi16(e, t));
+    if (y) C = _mm_add_epi32(C, _mm_add_epi32(_mm_madd_epi16(e, tp),
+                                              _mm_madd_epi16(ep, t)));
+    ep = e; tp = t;
+  }
+  A = _mm_add_epi32(A, _mm_srli_si128(A, 8));
+  A = _mm_add_epi32(A, _mm_srli_si128(A, 4));
+  C = _mm_add_epi32(C, _mm_srli_si128(C, 8));
+  C = _mm_add_epi32(C, _mm_srli_si128(C, 4));
+  return 20 * (int64_t)_mm_cvtsi128_si32(A) + 6 * (int64_t)_mm_cvtsi128_si32(C);
+#else
+  int e[8][8], t[8][8], x, y;
+  int64_t g = 0;
+  for (y = 0; y < 8; y++)
+    for (x = 0; x < 8; x++) e[y][x] = d[y * st + x] - s[y * st + x];
+  for (y = 0; y < 8; y++)
+    for (x = 0; x < 8; x++)
+      t[y][x] = 20 * e[y][x] + 6 * ((x ? e[y][x - 1] : 0) + (x < 7 ? e[y][x + 1] : 0));
+  for (y = 0; y < 8; y++)
+    for (x = 0; x < 8; x++)
+      g += (int64_t)e[y][x] * (20 * t[y][x] + 6 * ((y ? t[y - 1][x] : 0) + (y < 7 ? t[y + 1][x] : 0)));
+  return g;
+#endif
+}
+/* Chroma mode cost. BT.601 scales a U error by 4.22 and a V error by 3.21
+ * RGB energy per pixel against luma's 4.06, so with the upsampler form the
+ * weights are 16.6/16 and 12.7/16 of it; 18/16 and 14/16 measured best
+ * (16/12 .. 26/20). Plain chroma SSE under-weighted the smooth errors (a
+ * staircase left by a cheap DC prediction) up to 4x, so the mode pick took
+ * them: edges 512 q30 decoded U at 42.5 dB, lib 49.3. Only the mode pick
+ * uses the weight - RDOQ with it (its kills are high-frequency) and a flat
+ * 4x weight both lost on photo/noise. */
+#define W1_UV_WU 18
+#define W1_UV_WV 14
 static W1_UNUSED uint64_t w1_vp8e_chroma_try(w1_vp8e_t *en, int mbx, int mby,
                                             int ymode, int uvmode,
                                             int16_t (*lev)[16], uint64_t limit) {
@@ -10516,7 +12222,7 @@ static W1_UNUSED uint64_t w1_vp8e_chroma_try(w1_vp8e_t *en, int mbx, int mby,
   uint8_t *vp = en->d.plane_v + mby * 8 * uvs + mbx * 8;
   const uint8_t *ou = en->org_u + mby * 8 * uvs + mbx * 8;
   const uint8_t *ov = en->org_v + mby * 8 * uvs + mbx * 8;
-  int64_t sse = 0;
+  int64_t sse = 0, ssep[2] = {0, 0};
   int bits = w1k_vp8e_uvmode_bits8[uvmode];
   int64_t lam = en->lam * (int64_t)en->dq[3] * en->dq[3] /
                 ((int64_t)en->dq[1] * en->dq[1]);
@@ -10543,7 +12249,7 @@ static W1_UNUSED uint64_t w1_vp8e_chroma_try(w1_vp8e_t *en, int mbx, int mby,
       /* Zero residual reconstructs to the prediction: same SSE as the
        * dequant/block_residue round trip would have produced. */
       memset(lev[16 + b], 0, 16 * sizeof(int16_t));
-      sse += (int64_t)w1_vp8e_sse4(sp, uvs, dp, uvs);
+      ssep[pl] += (int64_t)w1_vp8e_sse4(sp, uvs, dp, uvs);
     } else {
       w1_vp8e_fdct(res, coef);
       w1_vp8e_quant_pre(coef, en->qp + 2, en->qp + 3, 0, lev[16 + b]);
@@ -10552,15 +12258,23 @@ static W1_UNUSED uint64_t w1_vp8e_chroma_try(w1_vp8e_t *en, int mbx, int mby,
         int16_t dq[16];
         w1_vp8e_dequant(lev[16 + b], en->dq[2], en->dq[3], dq);
         w1_vp8_block_residue(dp, uvs, dq);
-        sse += (int64_t)w1_vp8e_sse4(sp, uvs, dp, uvs);
+        ssep[pl] += (int64_t)w1_vp8e_sse4(sp, uvs, dp, uvs);
       }
     }
-    bits += en->rd_probs ? w1_vp8e_block_cost(2, lf, ab,
-      w1k_vp8_ctx_left[16 + b], w1k_vp8_ctx_above[16 + b], lev[16 + b], en->rd_probs)
+    /* Lower bound of the weighted distortion (wdist >= 64 * SSE). */
+    sse = en->uv_flat ? ssep[0] + ssep[1]
+                      : (ssep[0] * W1_UV_WU + ssep[1] * W1_UV_WV) >> 6;
+    if ((uint64_t)sse * 8 + (uint64_t)bits * (uint64_t)lam >= limit)
+      return limit;                 /* the block's bits only add */
+    bits += en->rd_probs ? w1_vp8e_block_cost_lc(2, lf, ab,
+      w1k_vp8_ctx_left[16 + b], w1k_vp8_ctx_above[16 + b], lev[16 + b], w1_vp8e_lc_ensure(en))
       : w1_vp8e_block_bits8(lev[16 + b], 0);
     if ((uint64_t)sse * 8 + (uint64_t)bits * (uint64_t)lam >= limit)
       return limit;
   }
+  if (!en->uv_flat)
+    sse = (w1_vp8e_uv_wdist(ou, up, uvs) * W1_UV_WU +
+           w1_vp8e_uv_wdist(ov, vp, uvs) * W1_UV_WV) >> 12;
   return (uint64_t)sse * 8 + (uint64_t)bits * (uint64_t)lam;
 }
 
@@ -10922,6 +12636,29 @@ static W1_UNUSED uint64_t w1_vp8e_mb_predcost(const uint8_t *org, int ostride,
   return best;
 }
 
+/* Synthetic-content test: at least 7/10 of the luma pixels match their
+ * gradient prediction (left + above - above-left) within +-1. Drawn or
+ * generated content (flat fills, linear ramps, glyphs, pixel art) passes;
+ * camera photos do not (0.35-0.6 on the real corpus). Classification-only. */
+static W1_UNUSED int w1_vp8e_exact_predictable(const uint8_t *org,
+                                               int ostride, int w, int h) {
+  size_t hit = 0, n;
+  int x, y;
+  if (w < 2 || h < 2) return 0;
+  n = (size_t)(w - 1) * (size_t)(h - 1);
+  for (y = 1; y < h; y++) {
+    const uint8_t *r = org + (size_t)y * ostride, *u = r - ostride;
+    for (x = 1; x < w; x++) {
+      int p = (int)r[x - 1] + (int)u[x] - (int)u[x - 1];
+      int d;
+      p = p < 0 ? 0 : p > 255 ? 255 : p;
+      d = (int)r[x] - p;
+      hit += (size_t)(d >= -1 && d <= 1);
+    }
+  }
+  return hit * 10 >= n * 7;
+}
+
 /* Smooth/complex split by min-predict residual against an absolute,
  * quantizer-scaled threshold T: seg 0 holds MBs whose best-16x16 residue
  * is within a few base-quant steps (safe to coarsen), seg 1 the rest at
@@ -11085,9 +12822,10 @@ static W1_UNUSED uint64_t w1_vp8e_rgb_sse_row(const uint8_t *sp,
   return s;
 }
 
-static W1_UNUSED uint64_t w1_vp8e_frame_sse(w1_vp8e_t *en,
-                                            const uint8_t *rgba,
-                                            size_t stride, uint8_t *scratch) {
+/* RGB SSE of the decoder's (fancy-upsampled) output rows [y0, y1). */
+static W1_UNUSED uint64_t w1_vp8e_band_sse(w1_vp8e_t *en, const uint8_t *rgba,
+                                           size_t stride, uint8_t *scratch,
+                                           int y0, int y1) {
   const int w = en->w, h = en->h;
   const int ys = en->d.y_stride, uvs = en->d.uv_stride;
   const uint8_t *y = en->d.plane_y;
@@ -11095,16 +12833,20 @@ static W1_UNUSED uint64_t w1_vp8e_frame_sse(w1_vp8e_t *en,
   uint8_t *second = scratch + (size_t)w * 4;
   uint64_t s = 0;
   int k;
-  w1_fancy_pair(y, NULL, u, v, u, v, scratch, NULL, w);
-  s += w1_vp8e_rgb_sse_row(rgba, scratch, w);
-  for (k = 1; k <= (h - 1) / 2; k++) {
+  if (y0 == 0) {
+    w1_fancy_pair(y, NULL, u, v, u, v, scratch, NULL, w);
+    s += w1_vp8e_rgb_sse_row(rgba, scratch, w);
+  }
+  for (k = y0 < 2 ? 1 : (y0 + 1) / 2; k <= (h - 1) / 2 && 2 * k - 1 < y1; k++) {
     w1_fancy_pair(y + (2 * k - 1) * ys, y + 2 * k * ys,
                   u + (k - 1) * uvs, v + (k - 1) * uvs,
                   u + k * uvs, v + k * uvs, scratch, second, w);
-    s += w1_vp8e_rgb_sse_row(rgba + (size_t)(2 * k - 1) * stride, scratch, w);
-    s += w1_vp8e_rgb_sse_row(rgba + (size_t)(2 * k) * stride, second, w);
+    if (2 * k - 1 >= y0)
+      s += w1_vp8e_rgb_sse_row(rgba + (size_t)(2 * k - 1) * stride, scratch, w);
+    if (2 * k < y1)
+      s += w1_vp8e_rgb_sse_row(rgba + (size_t)(2 * k) * stride, second, w);
   }
-  if (!(h & 1)) {
+  if (!(h & 1) && h - 1 >= y0 && h - 1 < y1) {
     const int last = (h - 1) / 2;
     w1_fancy_pair(y + (h - 1) * ys, NULL,
                   u + last * uvs, v + last * uvs,
@@ -11114,11 +12856,67 @@ static W1_UNUSED uint64_t w1_vp8e_frame_sse(w1_vp8e_t *en,
   return s;
 }
 
+static W1_UNUSED uint64_t w1_vp8e_frame_sse(w1_vp8e_t *en,
+                                            const uint8_t *rgba,
+                                            size_t stride, uint8_t *scratch) {
+  return w1_vp8e_band_sse(en, rgba, stride, scratch, 0, en->h);
+}
+
+/* Loop-filter trial: RGB SSE after filtering the unfiltered reconstruction
+ * (kept in `save`, same layout as the planes) at `level`. step 1 scores the
+ * whole frame. step > 1 scores a 12-row window per step-th MB row r,
+ * rows [16r-3, 16r+9): row r+1's top edge reaches 3 luma rows up and
+ * chroma rows 8r+5.., which the fancy upsampler first reads for luma row
+ * 16r+9, so filtering MB rows r-1 and r settles the window. It is an
+ * estimate, not the decoder's output: row r-1 starts from unfiltered row
+ * r-2 above it, and edge decisions chain down from there. */
+static W1_UNUSED uint64_t w1_vp8e_lf_trial(w1_vp8e_t *en, const uint8_t *rgba,
+                                           size_t stride, uint8_t *scratch,
+                                           const uint8_t *save, int level,
+                                           int step) {
+  const int mb_w = (en->w + 15) / 16, mb_h = (en->h + 15) / 16;
+  const size_t ys = (size_t)en->d.y_stride, uvs = (size_t)en->d.uv_stride;
+  const size_t y_sz = ys * (size_t)mb_h * 16, uv_sz = uvs * (size_t)mb_h * 8;
+  uint8_t *py = en->d.plane_y, *pu = en->d.plane_u, *pv = en->d.plane_v;
+  uint64_t s = 0;
+  int r, rr, col;
+  en->d.level = level;
+  if (step <= 1) {
+    memcpy(py, save, y_sz);
+    memcpy(pu, save + y_sz, uv_sz);
+    memcpy(pv, save + y_sz + uv_sz, uv_sz);
+    if (level)
+      for (rr = 0; rr < mb_h; rr++)
+        for (col = 0; col < mb_w; col++) w1_vp8_filter_mb(&en->d, col, rr);
+    return w1_vp8e_frame_sse(en, rgba, stride, scratch);
+  }
+  for (r = step / 2 > 0 ? step / 2 : 1; r < mb_h; r += step) {
+    const int r0 = r - 1, r1 = r + 1;
+    const size_t ly0 = r0 ? (size_t)r0 * 16 - 4 : 0, ly1 = (size_t)r1 * 16;
+    const size_t cy0 = r0 ? (size_t)r0 * 8 - 4 : 0, cy1 = (size_t)r1 * 8;
+    const int ya = r * 16 - 3, yb = r * 16 + 9 < en->h ? r * 16 + 9 : en->h;
+    memcpy(py + ly0 * ys, save + ly0 * ys, (ly1 - ly0) * ys);
+    memcpy(pu + cy0 * uvs, save + y_sz + cy0 * uvs, (cy1 - cy0) * uvs);
+    memcpy(pv + cy0 * uvs, save + y_sz + uv_sz + cy0 * uvs, (cy1 - cy0) * uvs);
+    if (level)
+      for (rr = r0; rr < r1; rr++)
+        for (col = 0; col < mb_w; col++) w1_vp8_filter_mb(&en->d, col, rr);
+    s += w1_vp8e_band_sse(en, rgba, stride, scratch, ya, yb);
+  }
+  return s;
+}
+
 typedef struct {
   const uint8_t *probs;
   int force_b, lambda_num, uv_delta;
   int polish;                 /* exact-cost trellis on the winner levels */
   int no_lf_bump;             /* suppress the smooth-frame deblock bump */
+  int uv_flat;                /* chroma mode pick on plain SSE (see
+                               * w1_vp8e_chroma_try): effort 9's q/uv-delta
+                               * search lost fronts with the weighted pick */
+  uint64_t *final_sse;         /* nullable: decoded RGB SSE of the emitted
+                               * frame at its final deblock setting, for
+                               * the top-q dominance check */
 } w1_vp8e_rd_t;
 
 /* Defined with the q-map helpers; used by the sweep adoption rule. */
@@ -11141,6 +12939,12 @@ static W1_UNUSED int w1_vp8_encode_frame_core(const uint8_t *rgba, size_t stride
   const size_t uv_sz = (size_t)mb_w * 8 * ((size_t)mb_h * 8);
   const size_t n_mb = (size_t)mb_w * (size_t)mb_h;
   const int filter_search = rd && rd->no_lf_bump < 0 && prepared && n_mb >= 16;
+  /* The deblock climb below serves the single-pass encodes (effort 0-6).
+   * Effort 9 scores candidate encodes by their filtered SSE (sse_out) and
+   * keeps its own full-frame list: fed climbed levels, its selection picked
+   * strictly worse points (edges 256 q55 734 B 44.22 dB -> 756 B 43.68). */
+  const int lf_climb = rd && prepared && n_mb >= 16 && !sse_out &&
+                       !filter_search;
   /* Control headroom covers worst-case prob updates (~2.5 KB). */
   const size_t ctl_cap = 1094 + 32 * n_mb + 16 + 4096;
   const size_t need = w1_vp8e_work_worst(mb_w, mb_h) + ctl_cap;
@@ -11156,6 +12960,7 @@ static W1_UNUSED int w1_vp8_encode_frame_core(const uint8_t *rgba, size_t stride
   int zero_counts[12] = {0};
   uint8_t *adapt_probs, *adapt_upd;
   uint8_t model_probs[1056];
+  uint16_t lc_tab[96 * W1_LC_W];
   const int learn_probs = !rd || !rd->probs;
   int64_t adapt_net;
   int seg_on = 0;
@@ -11176,7 +12981,7 @@ static W1_UNUSED int w1_vp8_encode_frame_core(const uint8_t *rgba, size_t stride
   if (level < 0) level = 0; else if (level > 63) level = 63;
   if (sharpness < 0) sharpness = 0; else if (sharpness > 7) sharpness = 7;
   if (!work || work_cap < need) return 1;
-  if (sse_out || filter_search) {
+  if (sse_out || filter_search || lf_climb || (rd && rd->final_sse)) {
     size_t off = (need + 15u) & ~(size_t)15;
     if (work_cap >= off + (size_t)w * (size_t)h * 4 + 16)
       rec_rgba = work + off;
@@ -11191,7 +12996,7 @@ static W1_UNUSED int w1_vp8_encode_frame_core(const uint8_t *rgba, size_t stride
   en.org_y = (uint8_t *)w1_bump_alloc(&bump, y_sz, 1);
   en.org_u = (uint8_t *)w1_bump_alloc(&bump, uv_sz, 1);
   en.org_v = (uint8_t *)w1_bump_alloc(&bump, uv_sz, 1);
-  if (filter_search) filter_save = (uint8_t *)(void *)en.org_y;
+  if (filter_search || lf_climb) filter_save = (uint8_t *)(void *)en.org_y;
   seg = (uint8_t *)w1_bump_alloc(&bump, n_mb, 1);
   ymb = (uint8_t *)w1_bump_alloc(&bump, n_mb, 1);
   eo = (uint8_t *)w1_bump_alloc(&bump, n_mb, 1);
@@ -11227,6 +13032,7 @@ static W1_UNUSED int w1_vp8_encode_frame_core(const uint8_t *rgba, size_t stride
   memcpy(model_probs, w1k_vp8_coef_dflt, sizeof(model_probs));
   en.rd_probs = learn_probs ? model_probs : rd->probs;
   en.tc_probs = NULL;
+  en.lc_probs = NULL; en.lc = lc_tab;
   en.polish_on = rd ? rd->polish : 0;
   if (prepared) {
     en.org_y = prepared; en.org_u = prepared + y_sz;
@@ -11335,6 +13141,9 @@ static W1_UNUSED int w1_vp8_encode_frame_core(const uint8_t *rgba, size_t stride
    * quantisation level is worth ~dq*dq/16 of block SSE, which measured best
    * (and within noise of every other setting) against the reference. Pass 1
    * re-derives this per MB from its segment's own AC step below. */
+#ifndef W1_B_RATE_BITS
+#define W1_B_RATE_BITS 128
+#endif
 #ifndef W1_LAM_DIV
 #define W1_LAM_DIV 32
 #endif
@@ -11347,6 +13156,7 @@ static W1_UNUSED int w1_vp8_encode_frame_core(const uint8_t *rgba, size_t stride
       w1_vp8e_quant_plan(&plans[si][qi], en.d.dqf[si][qi], en.max_lev);
   }
   en.mb_w = mb_w; en.mb_h = mb_h; en.w = w; en.h = h;
+  en.uv_flat = rd ? rd->uv_flat : 0;
   memcpy(en.d.coef_probs, w1k_vp8_coef_dflt, 1056);
 
   w1_benc_init(&ctl, ctl_buf, ctl_cap);
@@ -11360,6 +13170,7 @@ static W1_UNUSED int w1_vp8_encode_frame_core(const uint8_t *rgba, size_t stride
       (void)w1_vp8e_adapt_probs(tok_counts, w1k_vp8_coef_dflt,
                                model_probs, adapt_upd);
       en.tc_probs = NULL;
+      en.lc_probs = NULL;
     }
     memset(en.d.left_tok, 0, 9);
     en.d.left_ym = 0;
@@ -11421,21 +13232,37 @@ static W1_UNUSED int w1_vp8_encode_frame_core(const uint8_t *rgba, size_t stride
        * bmode overhead can only lose). The old org-domain fine-structure
        * test excluded iid-noise MBs, but 4x4 prediction pays there too;
        * the measured RD compare below keeps B only when it wins. seg0
-       * (sub-quantizer 16x16 residue) still skips the trial. */
+       * (sub-quantizer 16x16 residue) still skips the trial. At fine
+       * quantizers the i16 residual is sub-threshold almost everywhere, but
+       * its tokens are what 4x4 prediction saves: so B is also tried when
+       * the i16 rate (cost minus distortion, over lambda) exceeds
+       * W1_B_RATE_BITS. Without it q90+ lost B entirely (text 512 q95: 0 B
+       * MBs, 37556 B -> 28180 B at +0.6 dB, lib 30566).
+       * Not at q_index 0 (y AC step 4): there the lambda floor mis-trades
+       * (edges 256 q100 +11% bytes for +0.06 dB, text q100 -2.5 dB). */
       {
         uint64_t sseB = sse4[ymode];
+        int by_rate = sseB <= (uint64_t)64 && en.dq[1] > 4 &&
+            bestc - sseB * 8 > (uint64_t)en.lam * 8 * W1_B_RATE_BITS;
 #ifdef W1_B_ALWAYS
         if (1) {
 #elif defined(W1_B_OFF)
         if (0) {
 #else
-        if ((rd && rd->force_b) || sseB > (uint64_t)64) {
+        if ((rd && rd->force_b) || sseB > (uint64_t)64 || by_rate) {
 #endif
           uint64_t bcost;
           int16_t blev[16][16];
           memset(blev, 0, sizeof(blev));
           bcost = w1_vp8e_b_try(&en, col, row, blev, bbmodes,
                                 rd && rd->force_b ? ~(uint64_t)0 : bestc);
+          /* A rate-admitted B must not trade accuracy for its estimated
+           * saving: on smooth ramps (alpha_sweep 64 q95) B's SSE ran 3x+
+           * i16's for a rate cut that never materialized (542 B at 46.13
+           * dB -> 534 at 43.76). Text keeps its B (SSE within 2x). */
+          if (by_rate && !(rd && rd->force_b) && bcost < bestc &&
+              en.b_sse > sseB * 2)
+            bcost = ~(uint64_t)0;
           if ((rd && rd->force_b) || bcost < bestc) {
             bestc = bcost; ymode = W1_VP8_B;
             for (k = 0; k < 16; k++)
@@ -11518,6 +13345,89 @@ static W1_UNUSED int w1_vp8_encode_frame_core(const uint8_t *rgba, size_t stride
     }
   }
 
+  /* Deblock level: the q mapping is 0 below q_index 14, but sharp content
+   * wants a light filter there too (edges 128 q85: filt 0 -> 4 is 42.37 ->
+   * 43.54 dB at identical bytes; lib picks 2-4 per segment), and at mid q
+   * the best level is often far from the mapping. Filtering is decoder-side
+   * only, so the payload never changes. The decoded RGB SSE is unimodal in
+   * level only within a high-edge-variance threshold regime (the threshold
+   * steps at 15 and 40: edges 128 q_index 52 has minima at 10 and 16), so a
+   * ladder climb runs from the mapped level inside each regime, walking
+   * through ties (small levels can leave every edge unfiltered). Frames of
+   * 16+ MB rows are scored on ~8 sampled MB rows: a full-frame trial costs
+   * midnight (1280x1040) 1.5 ms. */
+  if (lf_climb) {
+    static const int ladder[18] = {0, 2, 4, 6, 8, 10, 12, 14,
+                                   16, 20, 24, 28, 32, 36,
+                                   40, 48, 56, 63};
+    static const int rlo[3] = {0, 15, 40}, rhi[3] = {14, 39, 63};
+    const int step = mb_h >= 16 ? mb_h / 8 : 1;
+    uint64_t ms, bs, cs, ts;
+    int best = level, best_sh = sharpness, cur, dir, i, g, top = 0;
+    memcpy(filter_save, rec_y, y_sz);
+    memcpy(filter_save + y_sz, rec_u, uv_sz);
+    memcpy(filter_save + y_sz + uv_sz, rec_v, uv_sz);
+    ms = bs = w1_vp8e_lf_trial(&en, rgba, stride, rec_rgba, filter_save, level, step);
+    for (g = 0; g < 3; g++) {
+      int from = level < rlo[g] ? rlo[g] : level > rhi[g] ? rhi[g] : level;
+      uint64_t fs;
+      int moved = 0;
+      if (g == 2 && level < 32 && !top) continue;
+      if (from != level) {
+        /* the regime's rung nearest the mapped level */
+        if (level < rlo[g]) {
+          for (i = 0; ladder[i] < rlo[g]; i++) {}
+        } else {
+          for (i = 17; ladder[i] > rhi[g]; i--) {}
+        }
+        from = ladder[i];
+        fs = w1_vp8e_lf_trial(&en, rgba, stride, rec_rgba, filter_save, from, step);
+        if (fs < bs) { bs = fs; best = from; }
+      } else fs = ms;
+      for (dir = 1; dir >= -1 && !moved; dir -= 2) {
+        cur = from; cs = fs;
+        for (;;) {
+          int next = -1;
+          if (dir > 0) {
+            for (i = 0; i < 18; i++) if (ladder[i] > cur) { next = ladder[i]; break; }
+          } else {
+            for (i = 17; i >= 0; i--) if (ladder[i] < cur) { next = ladder[i]; break; }
+          }
+          if (next < rlo[g] || next > rhi[g]) break;
+          ts = w1_vp8e_lf_trial(&en, rgba, stride, rec_rgba, filter_save, next, step);
+          if (ts > cs) break;
+          if (ts < cs) moved = 1;
+          if (ts < bs) { bs = ts; best = next; }
+          cur = next; cs = ts;
+        }
+        /* smooth frames keep improving past 36 (gray_ramp 64 q30 wants 40+) */
+        if (g == 1 && dir > 0 && cur == 36) top = 1;
+      }
+    }
+    /* Sharpness lowers the interior limit (less smoothing inside blocks
+     * that keep MB-edge filtering): walk it up at the chosen level. */
+    if (best > 0) {
+      cs = bs;
+      en.d.level = best;
+      for (i = sharpness + 1; i <= 7; i++) {
+        en.d.sharpness = i;
+        ts = w1_vp8e_lf_trial(&en, rgba, stride, rec_rgba, filter_save, best, step);
+        if (ts > cs) break;
+        if (ts < bs) { bs = ts; best_sh = i; }
+        cs = ts;
+      }
+    }
+    /* A sampled score can mislead by a hair (edges 512 q30: +0.014%
+     * sampled, -2.4% on the full frame), so a sampled winner must beat the
+     * mapped level by 1/1024; every sampled miss traced was under 1/4000,
+     * and the gains given up are under 0.005 dB. */
+    if (step > 1 && (ms - bs) * 1024 <= ms) { best = level; best_sh = sharpness; }
+    memcpy(rec_y, filter_save, y_sz);
+    memcpy(rec_u, filter_save + y_sz, uv_sz);
+    memcpy(rec_v, filter_save + y_sz + uv_sz, uv_sz);
+    en.d.level = best;
+    en.d.sharpness = best_sh;
+  }
   if (filter_search) {
     const int levels[9] = {level, 0, 20, 16, 40, 63, 16, 16, 16};
     const int sharps[9] = {sharpness, 0, 0, 0, 0, 0, 1, 2, 3};
@@ -11551,8 +13461,10 @@ static W1_UNUSED int w1_vp8_encode_frame_core(const uint8_t *rgba, size_t stride
     }
     level = best_level; sharpness = best_sharp;
     en.d.level = level; en.d.sharpness = sharpness;
+  } else if (lf_climb) {
+    level = en.d.level;
+    sharpness = en.d.sharpness;
   }
-
   adapt_net = w1_vp8e_adapt_probs(tok_counts, w1k_vp8_coef_dflt,
                                   adapt_probs, adapt_upd);
   {
@@ -11637,6 +13549,12 @@ static W1_UNUSED int w1_vp8_encode_frame_core(const uint8_t *rgba, size_t stride
     }
   } else if (sse_out) {
     *sse_out = 0;
+  }
+  if (rd && rd->final_sse && !sse_out && rec_rgba) {
+    if (en.d.level)
+      for (row = 0; row < mb_h; row++)
+        for (col = 0; col < mb_w; col++) w1_vp8_filter_mb(&en.d, col, row);
+    *rd->final_sse = w1_vp8e_frame_sse(&en, rgba, stride, rec_rgba);
   }
   return 0;
 }
@@ -11796,12 +13714,17 @@ static W1_UNUSED size_t w1_vp8l_work_worst(int w, int h) {
   t += (uint64_t)5 * (uint64_t)W1_LE_NG * 4;     /* htmp */
   t += (uint64_t)2048 * 4;                       /* cache */
   t += (uint64_t)14 * 1024 * 4;                  /* phist */
-  if (npix <= (uint64_t)W1_LZ_OPT_MAXN) t += (uint64_t)16 * npix + 8; /* dp+back+2 near */
+  t += (uint64_t)W1_LE_PC_TILES * 14 * 8 + 8;    /* pcost */
+  t += (uint64_t)16 * npix + 8;                  /* dp+back+2 near (L9 final run) */
   t += (uint64_t)W1_LE_NC;                       /* flat */
   t += (uint64_t)2 * (uint64_t)W1_LE_MAXG * W1_LE_NC * 4;  /* gcounts+grcounts */
   t += (uint64_t)W1_LE_MAXG * W1_LE_NC * 4;      /* gcodes */
   t += (uint64_t)W1_LE_MAXG * W1_LE_NC;          /* glens */
-  t += (uint64_t)8 * npix + 65536 + 256;         /* portfolio second payload */
+  t += (uint64_t)2 * ((uint64_t)8 * npix + 65536 + 256); /* portfolio run + winner payloads */
+  t += (uint64_t)W1_LE_PM_SLOTS * tw * th + sizeof(w1_le_pmemo_t) + 8; /* L9 predict memo */
+  t += (uint64_t)2 * W1_LZ_SMALL_N * 4 + 8;      /* small match-table slot */
+  t += (uint64_t)W1_LE_SM_SLOTS * (npix / 8 + 66 + (uint64_t)W1_LE_NC * 9 + 8) +
+       sizeof(w1_le_smemo_t) + 8;                /* L9 final-stream memo */
   t += 4096;                                     /* bump alignment slack */
   if (t > (uint64_t)(size_t)-1) return (size_t)-1;
   return (size_t)t;
@@ -12240,6 +14163,44 @@ static W1_UNUSED int w1_enc_lossy_payload(w1_mux_t *m, const uint8_t *rgba,
       win_nobump = att_nobump[n_att];
       n_att++;
     }
+    /* Top-q dominance check (effort 6-8). At the finest quantizers the
+     * rate-distortion curve is not monotone: the decoded error there is a
+     * count of +-1 rounding misses, and mode, RDOQ and deblock decisions flip
+     * between neighbouring q_index values, so the requested quantizer's
+     * encode is often beaten on BOTH axes by a slightly coarser one (text 512
+     * q100: q_index 0 40938 B / 61.0 dB, q_index 1 34130 B / 66.0 dB;
+     * gradient 64 q95: 474 B / 48.3 dB vs 410 B / 48.9 dB). Encode
+     * q_index+1..+W1_DOM_K and emit the lowest-SSE one among those no
+     * longer and no worse than the request - strictly dominating, never a
+     * trade. Offsets 1, 2 and 3 all win somewhere, and neither side of the
+     * curve is monotone enough for an early stop. Costs W1_DOM_K encodes at
+     * q_index <= W1_DOM_QMAX (quality ~87+), so efforts 0-4 keep speed.
+     *
+     * Synthetic frames (w1_vp8e_exact_predictable) stay non-monotone well
+     * below the top: their residual is a small exact set (binary glyph
+     * edges, the +-1 staircase of a linear ramp), so whether a step lands on
+     * it flips PSNR by dB between neighbouring q_index values (text 256
+     * q79..q82: 42.9 / 48.6 / 44.6 / 48.4 dB at 5350..6042 B; edges 256
+     * q85 1486 B / 45.1 dB vs q86 1336 B / 45.7 dB). There the check runs
+     * up to W1_DOM_QMAX_SYN (quality ~70+) and also tries q_index-1, which
+     * is what wins edges q85. Camera photos fail the test and never pay. */
+#ifndef W1_DOM_QMAX
+#define W1_DOM_QMAX 12
+#endif
+#ifndef W1_DOM_QMAX_SYN
+#define W1_DOM_QMAX_SYN 28
+#endif
+#ifndef W1_DOM_K
+#define W1_DOM_K 3
+#endif
+    const int dom_on = effort >= 6 && effort < 9 && sweep_span == 0 &&
+                       !probe_ready && !is_flat && n_att == 1 &&
+                       (q <= W1_DOM_QMAX ||
+                        (q <= W1_DOM_QMAX_SYN && prepared &&
+                         w1_vp8e_exact_predictable(prepared,
+                           ((w + 15) / 16) * 16, w, h)));
+    uint64_t dom_s0 = 0;
+    w1_vp8e_rd_t dom_rd;
     for (att = 0; att <= n_att && rc == 0; att++) {
     const int lev = att < n_att ? att_level[att] : win_level;
     const int shp = att < n_att ? att_sharp[att] : win_sharp;
@@ -12269,6 +14230,8 @@ static W1_UNUSED int w1_enc_lossy_payload(w1_mux_t *m, const uint8_t *rgba,
     rduv.lambda_num = 8;
     rduv.polish = 0;
     rduv.no_lf_bump = nbump;
+    rduv.uv_flat = effort >= 9;
+    rduv.final_sse = NULL;
     /* UV delta from content (replaces textured/not binary): textured with
      * chroma noise (photo) -> coarser +6; textured near-grey (text) -> finer
      * -4; smooth ramp (gradient) -> -2; constant -> 0. */
@@ -12284,6 +14247,7 @@ static W1_UNUSED int w1_enc_lossy_payload(w1_mux_t *m, const uint8_t *rgba,
           chroma_act <= 6 &&
           chroma_range >= 64) uv_def = -13;
       rduv.uv_delta = uv_def;
+      if (dom_on) { rduv.final_sse = &dom_s0; dom_rd = rduv; }
     }
     size_t lens[3];
     uint8_t tried[128] = {0};
@@ -12542,6 +14506,8 @@ static W1_UNUSED int w1_enc_lossy_payload(w1_mux_t *m, const uint8_t *rgba,
           rd.probs = w1k_vp8_coef_dflt; rd.force_b = 1;
           rd.lambda_num = 8; rd.uv_delta = 0; rd.polish = 0;
           rd.no_lf_bump = nbump;
+          rd.uv_flat = effort >= 9;
+          rd.final_sse = NULL;
           if (w1_vp8_encode_frame_core(rgba, stride, w, h, center,
                 lev, shp, payload, m->cap - m->pos, &clen,
                 vp8_work, vp8_sz, NULL, NULL, prepared, predcost, &rd, 0) == 0) {
@@ -12644,6 +14610,8 @@ static W1_UNUSED int w1_enc_lossy_payload(w1_mux_t *m, const uint8_t *rgba,
             rd.probs = fin_have ? fin_probs : w1k_vp8_coef_dflt;
             rd.force_b = 0; rd.lambda_num = 4; rd.uv_delta = fin_delta;
             rd.polish = 1; rd.no_lf_bump = nbump;
+            rd.uv_flat = effort >= 9;
+            rd.final_sse = NULL;
             ok = w1_vp8_encode_frame_core(rgba, stride, w, h, fin_q, lev, shp,
                    payload, m->cap - m->pos, &plen, vp8_work, vp8_sz, &psse,
                    NULL, prepared, predcost, &rd, 0) == 0;
@@ -12683,6 +14651,8 @@ static W1_UNUSED int w1_enc_lossy_payload(w1_mux_t *m, const uint8_t *rgba,
           rd.uv_delta = probe_uv;
           rd.polish = !large_frame;
           rd.no_lf_bump = nbump;
+          rd.uv_flat = effort >= 9;
+          rd.final_sse = NULL;
           memcpy(saved, payload, bestlen);
           for (trial = 0; trial < trials; trial++) {
             size_t clen = 0;
@@ -12785,6 +14755,36 @@ static W1_UNUSED int w1_enc_lossy_payload(w1_mux_t *m, const uint8_t *rgba,
     if (att < n_att) {
       last_ok = 1; last_level = lev; last_sharp = shp; last_nobump = nbump;
     }
+    }
+    if (rc == 0 && dom_on && elen > 0 && elen == win_len &&
+        m->cap - m->pos >= 4 * elen) {
+      uint8_t *main_p = m->base + m->pos - elen;
+      uint8_t *slot[2];   /* candidate / best-so-far, swapped on a win */
+      w1_vp8e_rd_t rdd;
+      uint64_t sd = 0, best_s = dom_s0;
+      size_t ld = 0, best_l = elen;
+      int d, best_d = 0, cur = 0;
+      const size_t half = (m->cap - m->pos) / 2;
+      slot[0] = m->base + m->pos;
+      slot[1] = slot[0] + half;
+      rdd = dom_rd;
+      rdd.final_sse = &sd;
+      for (d = q > W1_DOM_QMAX ? -1 : 1; d <= W1_DOM_K && q + d <= 127;
+           d++) {
+        if (d == 0) continue;
+        if (w1_vp8_encode_frame_core(rgba, stride, w, h, q + d, win_level,
+              win_sharp, slot[cur], half, &ld, vp8_work, vp8_sz, NULL, NULL,
+              prepared, predcost, &rdd, 0) != 0) continue;
+        if (ld <= elen && sd <= dom_s0 && (ld < elen || sd < dom_s0) &&
+            (sd < best_s || (sd == best_s && ld < best_l))) {
+          best_s = sd; best_l = ld; best_d = d; cur ^= 1;
+        }
+      }
+      if (best_d) {
+        memmove(main_p, slot[cur ^ 1], best_l);
+        m->pos = m->pos - elen + best_l;
+        elen = best_l;
+      }
     }
   }
   w1_mux_chunk_end(m, vpay);
